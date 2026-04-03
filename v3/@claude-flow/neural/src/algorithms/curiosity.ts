@@ -11,6 +11,7 @@
  */
 
 import type { CuriosityConfig, Trajectory, TrajectoryStep } from '../types.js';
+import { EMBEDDING_DIM } from '../embedding-constants.js';
 
 /**
  * Default Curiosity configuration
@@ -56,7 +57,7 @@ export class CuriosityModule {
   private rndMomentum: Float32Array;
 
   // Dimensions
-  private stateDim = 768;
+  private stateDim: number;
   private numActions = 4;
 
   // Running statistics for normalization
@@ -71,6 +72,7 @@ export class CuriosityModule {
 
   constructor(config: Partial<CuriosityConfig> = {}) {
     this.config = { ...DEFAULT_CURIOSITY_CONFIG, ...config };
+    this.stateDim = this.config.inputDim ?? EMBEDDING_DIM;
 
     const featureDim = this.config.featureDim;
 

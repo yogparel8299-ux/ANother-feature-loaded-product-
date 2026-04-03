@@ -24,6 +24,7 @@ type CommandLoader = () => Promise<{ default?: Command; [key: string]: Command |
 const commandLoaders: Record<string, CommandLoader> = {
   // P1 Core Commands (frequently used - load first)
   init: () => import('./init.js'),
+  wizard: () => import('./init.js'),
   start: () => import('./start.js'),
   status: () => import('./status.js'),
   task: () => import('./task.js'),
@@ -115,7 +116,7 @@ async function loadCommand(name: string): Promise<Command | undefined> {
 // These are the most commonly used commands that need instant access
 // =============================================================================
 
-import { initCommand } from './init.js';
+import { initCommand, wizardCommand } from './init.js';
 import { startCommand } from './start.js';
 import { statusCommand } from './status.js';
 import { taskCommand } from './task.js';
@@ -155,6 +156,7 @@ import { autopilotCommand } from './autopilot.js';
 
 // Pre-populate cache with core commands
 loadedCommands.set('init', initCommand);
+loadedCommands.set('wizard', wizardCommand);
 loadedCommands.set('start', startCommand);
 loadedCommands.set('status', statusCommand);
 loadedCommands.set('task', taskCommand);
@@ -238,6 +240,7 @@ export async function getAutopilotCommand() { return loadCommand('autopilot'); }
 export const commands: Command[] = [
   // Core commands (synchronously loaded)
   initCommand,
+  wizardCommand,
   startCommand,
   statusCommand,
   taskCommand,
@@ -266,6 +269,7 @@ export const commands: Command[] = [
 export const commandsByCategory = {
   primary: [
     initCommand,
+    wizardCommand,
     startCommand,
     statusCommand,
     agentCommand,

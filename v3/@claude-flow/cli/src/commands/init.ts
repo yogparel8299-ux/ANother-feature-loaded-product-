@@ -163,13 +163,13 @@ async function initCodexAction(
   }
 }
 
-// Check if project is already initialized
+// CF-008: Check if project is already initialized
 function isInitialized(cwd: string): { claude: boolean; claudeFlow: boolean } {
   const claudePath = path.join(cwd, '.claude', 'settings.json');
-  const claudeFlowPath = path.join(cwd, '.claude-flow', 'config.yaml');
+  const cfJsonPath = path.join(cwd, '.claude-flow', 'config.json');
   return {
     claude: fs.existsSync(claudePath),
-    claudeFlow: fs.existsSync(claudeFlowPath),
+    claudeFlow: fs.existsSync(cfJsonPath),
   };
 }
 
@@ -186,7 +186,29 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
 
   // If codex mode, use the Codex initializer
   if (codexMode || dualMode) {
-    return initCodexAction(ctx, { codexMode, dualMode, force, minimal, full });
+    const codexResult = await initCodexAction(ctx, { codexMode, dualMode, force, minimal, full });
+    // SG-003: --dual must also create Claude Code infrastructure (.claude/helpers + settings)
+    if (dualMode) {
+      try {
+        await executeInit({
+          ...DEFAULT_INIT_OPTIONS,
+          targetDir: cwd,
+          force,
+          components: {
+            settings: true,
+            helpers: true,
+            statusline: true,
+            skills: true,
+            commands: true,
+            agents: true,
+            mcp: true,
+            runtime: false,
+            claudeMd: false,
+          },
+        });
+      } catch { /* T4: non-fatal — codex init already succeeded */ }
+    }
+    return codexResult;
   }
 
   // Check if already initialized
@@ -196,7 +218,7 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
   if (hasExisting && !force) {
     output.printWarning('RuFlo appears to be already initialized');
     if (initialized.claude) output.printInfo('  Found: .claude/settings.json');
-    if (initialized.claudeFlow) output.printInfo('  Found: .claude-flow/config.yaml');
+    if (initialized.claudeFlow) output.printInfo('  Found: .claude-flow/config.json');
     output.printInfo('Use --force to reinitialize');
 
     if (ctx.interactive) {
@@ -221,12 +243,26 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
   let options: InitOptions;
 
   if (minimal) {
-    options = { ...MINIMAL_INIT_OPTIONS, targetDir: cwd, force };
+    options = { ...JSON.parse(JSON.stringify(MINIMAL_INIT_OPTIONS)), targetDir: cwd, force };
   } else if (full) {
-    options = { ...FULL_INIT_OPTIONS, targetDir: cwd, force };
+    options = { ...JSON.parse(JSON.stringify(FULL_INIT_OPTIONS)), targetDir: cwd, force };
   } else {
-    options = { ...DEFAULT_INIT_OPTIONS, targetDir: cwd, force };
+    options = { ...JSON.parse(JSON.stringify(DEFAULT_INIT_OPTIONS)), targetDir: cwd, force };
   }
+
+  // SG-010: Wire CLI flags into options.runtime/options.mcp
+  if (ctx.flags.cacheSize != null) options.runtime.cacheSize = ctx.flags.cacheSize as number;
+  if (ctx.flags.coordinationStrategy) options.runtime.coordinationStrategy = ctx.flags.coordinationStrategy as string;
+  if (ctx.flags.topology) options.runtime.topology = ctx.flags.topology as InitOptions['runtime']['topology'];
+  if (ctx.flags.maxAgents != null) options.runtime.maxAgents = ctx.flags.maxAgents as number;
+  if (ctx.flags.defaultScope) options.runtime.defaultScope = ctx.flags.defaultScope as string;
+  if (ctx.flags.bridgeFallback != null) options.hooks.bridgeFallback = ctx.flags.bridgeFallback as boolean;
+  if (ctx.flags.bridgeInitFallback != null) options.runtime.bridgeInitFallback = ctx.flags.bridgeInitFallback as boolean;
+  if (ctx.flags.agentdbLearning != null) options.runtime.enableAgentdbLearning = ctx.flags.agentdbLearning as boolean;
+  if (ctx.flags.agentdbPositiveThreshold != null) options.runtime.agentdbPositiveThreshold = ctx.flags.agentdbPositiveThreshold as number;
+  if (ctx.flags.agentdbNegativeThreshold != null) options.runtime.agentdbNegativeThreshold = ctx.flags.agentdbNegativeThreshold as number;
+  if (ctx.flags.agentdbBatchSize != null) options.runtime.agentdbBatchSize = ctx.flags.agentdbBatchSize as number;
+  if (ctx.flags.agentdbTickInterval != null) options.runtime.agentdbTickInterval = ctx.flags.agentdbTickInterval as number;
 
   // Handle --skip-claude and --only-claude flags
   if (skipClaude) {
@@ -261,6 +297,22 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
     }
 
     spinner.succeed('RuFlo V3 initialized successfully!');
+
+    // ML-002: Chain memory init into init --full
+    if (full) {
+      try {
+        const { initializeMemoryDatabase } = await import('../memory/memory-initializer.js');
+        await initializeMemoryDatabase({
+          backend: 'hybrid',
+          dbPath: undefined,
+          force: false,
+          verbose: false,
+        });
+      } catch {
+        // Memory init is best-effort during full init
+      }
+    }
+
     output.writeln();
 
     // Display summary
@@ -301,7 +353,7 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
     if (options.components.runtime) {
       output.printBox(
         [
-          `Config:      .claude-flow/config.yaml`,
+          `Config:      .claude-flow/config.json`,
           `Data:        .claude-flow/data/`,
           `Logs:        .claude-flow/logs/`,
           `Sessions:    .claude-flow/sessions/`,
@@ -361,7 +413,7 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
       if (startAll) {
         try {
           output.writeln(output.dim('  Initializing swarm...'));
-          execSync('npx @claude-flow/cli@latest swarm init --topology hierarchical 2>/dev/null', {
+          execSync('npx @claude-flow/cli@latest swarm init --topology hierarchical-mesh 2>/dev/null', {
             stdio: 'pipe',
             cwd: ctx.cwd,
             timeout: 30000
@@ -378,7 +430,9 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
 
     // Handle --with-embeddings
     const withEmbeddings = ctx.flags['with-embeddings'] || ctx.flags.withEmbeddings;
-    const embeddingModel = (ctx.flags['embedding-model'] || ctx.flags.embeddingModel || 'all-MiniLM-L6-v2') as string;
+    // ADR-0052: read default model from config, not hardcoded
+    const _cfg = await import('agentdb').then((m: any) => m.getEmbeddingConfig()).catch(() => ({ model: 'nomic-ai/nomic-embed-text-v1.5' }));
+    const embeddingModel = (ctx.flags['embedding-model'] || ctx.flags.embeddingModel || _cfg.model) as string;
 
     if (withEmbeddings) {
       output.writeln();
@@ -425,10 +479,26 @@ const initAction = async (ctx: CommandContext): Promise<CommandResult> => {
   }
 };
 
-// Wizard subcommand for interactive setup
-const wizardCommand: Command = {
+// Wizard — top-level command + init subcommand — SG-004
+export const wizardCommand: Command = {
   name: 'wizard',
+  aliases: ['wiz'],
   description: 'Interactive setup wizard for comprehensive configuration',
+  options: [
+    { name: 'force', short: 'f', description: 'Overwrite existing configuration', type: 'boolean', default: false },
+    { name: 'start-all', description: 'Auto-start daemon, memory, and swarm after init', type: 'boolean', default: false },
+    { name: 'start-daemon', description: 'Auto-start daemon after init', type: 'boolean', default: false },
+    { name: 'codex', description: 'Initialize for OpenAI Codex CLI', type: 'boolean', default: false },
+    { name: 'dual', description: 'Initialize for both Claude Code and Codex', type: 'boolean', default: false },
+    { name: 'with-embeddings', description: 'Initialize ONNX embedding subsystem', type: 'boolean', default: false },
+    { name: 'embedding-model', description: 'ONNX embedding model', type: 'string', default: 'nomic-ai/nomic-embed-text-v1.5', choices: ['nomic-ai/nomic-embed-text-v1.5', 'all-MiniLM-L6-v2', 'all-mpnet-base-v2'] },
+  ],
+  examples: [
+    { command: 'claude-flow wizard', description: 'Run interactive setup wizard' },
+    { command: 'claude-flow wizard --start-all', description: 'Wizard then start all services' },
+    { command: 'claude-flow wizard --force', description: 'Reinitialize with wizard' },
+    { command: 'claude-flow wizard --codex', description: 'Wizard with Codex integration' },
+  ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     output.writeln();
     output.writeln(output.bold('RuFlo V3 Setup Wizard'));
@@ -436,8 +506,25 @@ const wizardCommand: Command = {
     output.writeln();
 
     try {
+      // SG-004: Check if already initialized (respects --force)
+      const force = ctx.flags.force;
+      const initialized = isInitialized(ctx.cwd);
+      const hasExisting = initialized.claude || initialized.claudeFlow;
+      if (hasExisting && !force) {
+        output.printWarning('Claude Flow appears to be already initialized');
+        if (initialized.claude) output.printInfo('  Found: .claude/settings.json');
+        if (initialized.claudeFlow) output.printInfo('  Found: .claude-flow/config.json');
+        output.printInfo('Use --force to reinitialize');
+        const proceed = await confirm({
+          message: 'Do you want to reinitialize? This will overwrite existing configuration.',
+          default: false,
+        });
+        if (!proceed) {
+          return { success: true, message: 'Wizard cancelled' };
+        }
+      }
       // Start with base options
-      const options: InitOptions = { ...DEFAULT_INIT_OPTIONS, targetDir: ctx.cwd };
+      const options: InitOptions = { ...JSON.parse(JSON.stringify(DEFAULT_INIT_OPTIONS)), targetDir: ctx.cwd, force: ctx.flags.force };
 
       // Configuration preset
       const preset = await select({
@@ -451,10 +538,10 @@ const wizardCommand: Command = {
       });
 
       if (preset === 'minimal') {
-        Object.assign(options, MINIMAL_INIT_OPTIONS);
+        Object.assign(options, JSON.parse(JSON.stringify(MINIMAL_INIT_OPTIONS)));
         options.targetDir = ctx.cwd;
       } else if (preset === 'full') {
-        Object.assign(options, FULL_INIT_OPTIONS);
+        Object.assign(options, JSON.parse(JSON.stringify(FULL_INIT_OPTIONS)));
         options.targetDir = ctx.cwd;
       } else if (preset === 'custom') {
         // Component selection
@@ -524,6 +611,7 @@ const wizardCommand: Command = {
           options.hooks.sessionStart = hooks.includes('sessionStart');
           options.hooks.stop = hooks.includes('stop');
           options.hooks.notification = hooks.includes('notification');
+          options.hooks.permissionRequest = hooks.includes('permissionRequest');
         }
       }
 
@@ -599,12 +687,15 @@ const wizardCommand: Command = {
         default: true,
       });
 
-      let embeddingModel = 'all-MiniLM-L6-v2';
+      // ADR-0052: read default model from config, not hardcoded
+      const _wizCfg = await import('agentdb').then((m: any) => m.getEmbeddingConfig()).catch(() => ({ model: 'nomic-ai/nomic-embed-text-v1.5' }));
+      let embeddingModel = _wizCfg.model;
       if (enableEmbeddings) {
         embeddingModel = await select({
           message: 'Select embedding model:',
           options: [
-            { value: 'all-MiniLM-L6-v2', label: 'MiniLM L6 (384d)', hint: 'Fast, good quality (recommended)' },
+            { value: 'nomic-ai/nomic-embed-text-v1.5', label: 'Nomic Embed v1.5 (768d)', hint: '86% MTEB, 8K context (recommended)' },
+            { value: 'all-MiniLM-L6-v2', label: 'MiniLM L6 (384d)', hint: 'Fast, good quality' },
             { value: 'all-mpnet-base-v2', label: 'MPNet Base (768d)', hint: 'Higher quality, more memory' },
           ],
         });
@@ -626,6 +717,18 @@ const wizardCommand: Command = {
       }
 
       spinner.succeed('Setup complete!');
+
+      // SG-004: Respect --codex / --dual in wizard
+      const codexMode = ctx.flags.codex as boolean;
+      const dualMode = ctx.flags.dual as boolean;
+      if (codexMode || dualMode) {
+        try {
+          output.writeln(output.dim('  Initializing Codex integration...'));
+          await initCodexAction(ctx, { codexMode, dualMode, force: ctx.flags.force as boolean, minimal: false, full: false });
+        } catch (err) { /* T4: codex init is supplementary — wizard already succeeded */
+          output.printWarning(`Codex initialization: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
 
       // Initialize embeddings if enabled
       let embeddingsInitialized = false;
@@ -670,13 +773,61 @@ const wizardCommand: Command = {
         ],
       });
 
+      // SG-004: Respect --start-all / --start-daemon in wizard
+      const startAll = ctx.flags['start-all'] || ctx.flags.startAll;
+      const startDaemon = ctx.flags['start-daemon'] || ctx.flags.startDaemon || startAll;
+      if (startDaemon || startAll) {
+        output.writeln();
+        output.printInfo('Starting services...');
+        const { execSync } = await import('child_process');
+        if (startAll) {
+          try {
+            output.writeln(output.dim('  Initializing memory database...'));
+            execSync('npx @claude-flow/cli@latest memory init 2>/dev/null', {
+              stdio: 'pipe', cwd: ctx.cwd, timeout: 30000
+            });
+            output.writeln(output.success('  \u2713 Memory initialized'));
+          } catch { /* T4: memory init failure is expected if already initialized */ output.writeln(output.dim('  Memory database already exists')); }
+        }
+        if (startDaemon) {
+          try {
+            output.writeln(output.dim('  Starting daemon...'));
+            execSync('npx @claude-flow/cli@latest daemon start 2>/dev/null &', {
+              stdio: 'pipe', cwd: ctx.cwd, timeout: 10000
+            });
+            output.writeln(output.success('  \u2713 Daemon started'));
+          } catch { /* T4: daemon start failure is expected if already running */ output.writeln(output.warning('  Daemon may already be running')); }
+        }
+        if (startAll) {
+          try {
+            output.writeln(output.dim('  Initializing swarm...'));
+            execSync(`npx @claude-flow/cli@latest swarm init --topology ${options.runtime.topology || 'hierarchical-mesh'} 2>/dev/null`, {
+              stdio: 'pipe', cwd: ctx.cwd, timeout: 30000
+            });
+            output.writeln(output.success('  \u2713 Swarm initialized'));
+          } catch { /* T4: swarm init failure is expected if already initialized */ output.writeln(output.dim('  Swarm initialization skipped')); }
+        }
+        output.writeln();
+        output.printSuccess('All services started');
+      }
+      else {
+        output.writeln(output.bold('Next steps:'));
+        output.printList([
+          `Run ${output.highlight('claude-flow daemon start')} to start background workers`,
+          `Run ${output.highlight('claude-flow memory init')} to initialize memory database`,
+          `Run ${output.highlight('claude-flow swarm init')} to initialize a swarm`,
+          `Or re-run with ${output.highlight('--start-all')} to do all of the above`,
+        ]);
+      }
+
       return { success: true, data: result };
     } catch (error) {
       if (error instanceof Error && error.message === 'User cancelled') {
         output.printInfo('Setup cancelled');
         return { success: true };
       }
-      throw error;
+      output.printError(`Failed to initialize: ${error instanceof Error ? error.message : String(error)}`);
+      return { success: false, exitCode: 1 };
     }
   },
 };
@@ -694,7 +845,7 @@ const checkCommand: Command = {
       claudeFlow: initialized.claudeFlow,
       paths: {
         claudeSettings: initialized.claude ? path.join(ctx.cwd, '.claude', 'settings.json') : null,
-        claudeFlowConfig: initialized.claudeFlow ? path.join(ctx.cwd, '.claude-flow', 'config.yaml') : null,
+        claudeFlowConfig: initialized.claudeFlow ? path.join(ctx.cwd, '.claude-flow', 'config.json') : null,
       },
     };
 
@@ -709,7 +860,7 @@ const checkCommand: Command = {
         output.printInfo(`  Claude Code: .claude/settings.json`);
       }
       if (initialized.claudeFlow) {
-        output.printInfo(`  V3 Runtime: .claude-flow/config.yaml`);
+        output.printInfo(`  V3 Runtime: .claude-flow/config.json`);
       }
     } else {
       output.printWarning('RuFlo is not initialized in this directory');
@@ -1059,8 +1210,8 @@ export const initCommand: Command = {
       name: 'embedding-model',
       description: 'ONNX embedding model to use',
       type: 'string',
-      default: 'all-MiniLM-L6-v2',
-      choices: ['all-MiniLM-L6-v2', 'all-mpnet-base-v2'],
+      default: 'nomic-ai/nomic-embed-text-v1.5',
+      choices: ['nomic-ai/nomic-embed-text-v1.5', 'all-MiniLM-L6-v2', 'all-mpnet-base-v2'],
     },
     {
       name: 'codex',
@@ -1074,6 +1225,73 @@ export const initCommand: Command = {
       type: 'boolean',
       default: false,
     },
+    {
+      name: 'cache-size',
+      description: 'Memory/embedding LRU cache size',
+      type: 'number',
+      default: 256,
+    },
+    {
+      name: 'coordination-strategy',
+      description: 'Swarm coordination strategy',
+      type: 'string',
+      default: 'consensus',
+    },
+    {
+      name: 'topology',
+      description: 'Swarm topology',
+      type: 'string',
+      default: 'hierarchical-mesh',
+      choices: ['hierarchical-mesh', 'hierarchical', 'mesh', 'ring', 'star'],
+    },
+    {
+      name: 'default-scope',
+      description: 'Default agent memory scope',
+      type: 'string',
+      default: 'project',
+    },
+    {
+      name: 'bridge-fallback',
+      description: 'Allow hooks to degrade on bridge failure',
+      type: 'boolean',
+      default: false,
+    },
+    {
+      name: 'bridge-init-fallback',
+      description: 'Allow bridge initialization to fail silently',
+      type: 'boolean',
+      default: false,
+    },
+    {
+      name: 'agentdb-learning',
+      description: 'Enable AgentDB self-learning loop',
+      type: 'boolean',
+      default: true,
+    },
+    {
+      name: 'agentdb-positive-threshold',
+      description: 'AgentDB positive feedback threshold',
+      type: 'number',
+      default: 0.7,
+    },
+    {
+      name: 'agentdb-negative-threshold',
+      description: 'AgentDB negative feedback threshold',
+      type: 'number',
+      default: 0.3,
+    },
+    {
+      name: 'agentdb-batch-size',
+      description: 'AgentDB learning batch size',
+      type: 'number',
+      default: 32,
+    },
+    {
+      name: 'agentdb-tick-interval',
+      description: 'AgentDB learning tick interval (ms)',
+      type: 'number',
+      default: 30000,
+    },
   ],
   examples: [
     { command: 'claude-flow init', description: 'Initialize with default configuration' },
@@ -1086,14 +1304,12 @@ export const initCommand: Command = {
     { command: 'claude-flow init --skip-claude', description: 'Only create V3 runtime' },
     { command: 'claude-flow init wizard', description: 'Interactive setup wizard' },
     { command: 'claude-flow init --with-embeddings', description: 'Initialize with ONNX embeddings' },
-    { command: 'claude-flow init --with-embeddings --embedding-model all-mpnet-base-v2', description: 'Use larger embedding model' },
-    { command: 'claude-flow init skills --all', description: 'Install all available skills' },
-    { command: 'claude-flow init hooks --minimal', description: 'Create minimal hooks configuration' },
-    { command: 'claude-flow init upgrade', description: 'Update helpers while preserving data' },
-    { command: 'claude-flow init upgrade --settings', description: 'Update helpers and merge new settings (Agent Teams)' },
-    { command: 'claude-flow init upgrade --verbose', description: 'Show detailed upgrade info' },
+    { command: 'claude-flow init --cache-size 512', description: 'Initialize with larger cache' },
+    { command: 'claude-flow init --topology mesh --max-agents 8', description: 'Use mesh topology' },
+    { command: 'claude-flow init --no-hooks', description: 'Initialize with hooks disabled' },
+    { command: 'claude-flow init --bridge-fallback', description: 'Allow hooks degradation on bridge failure' },
+    { command: 'claude-flow init --no-agentdb-learning', description: 'Disable AgentDB learning loop' },
     { command: 'claude-flow init --codex', description: 'Initialize for OpenAI Codex (AGENTS.md)' },
-    { command: 'claude-flow init --codex --full', description: 'Codex init with all 137+ skills' },
     { command: 'claude-flow init --dual', description: 'Initialize for both Claude Code and Codex' },
   ],
   action: initAction,

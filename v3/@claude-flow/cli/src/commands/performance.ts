@@ -7,6 +7,7 @@
 
 import type { Command, CommandContext, CommandResult } from '../types.js';
 import { output } from '../output.js';
+import { EMBEDDING_DIM } from '../embedding-constants.js';
 
 // Benchmark subcommand - REAL measurements
 const benchmarkCommand: Command = {
@@ -89,10 +90,11 @@ const benchmarkCommand: Command = {
       const flashTimes: number[] = [];
 
       // Generate test vectors
+      // ADR-0052: matches embedding config default
       const testVectors: Float32Array[] = Array.from({ length: 100 }, () =>
-        new Float32Array(Array.from({ length: 384 }, () => Math.random()))
+        new Float32Array(Array.from({ length: EMBEDDING_DIM }, () => Math.random()))
       );
-      const queryVector = new Float32Array(Array.from({ length: 384 }, () => Math.random()));
+      const queryVector = new Float32Array(Array.from({ length: EMBEDDING_DIM }, () => Math.random()));
 
       // Warmup
       for (let i = 0; i < warmup; i++) {

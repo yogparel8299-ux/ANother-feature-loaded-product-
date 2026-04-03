@@ -36,6 +36,7 @@ import type {
   SwarmEventType,
 } from './types.js';
 import type { AgentDomain, DomainConfig, DomainStatus } from './unified-coordinator.js';
+import { EMBEDDING_DIM } from './embedding-constants.js';
 
 // =============================================================================
 // Types
@@ -363,6 +364,8 @@ export interface QueenCoordinatorConfig {
   enableFailover: boolean;
   /** Maximum delegation attempts */
   maxDelegationAttempts: number;
+  /** Embedding dimension for pattern matching (default: 768) */
+  embeddingDim: number;
 }
 
 /**
@@ -390,6 +393,7 @@ const DEFAULT_CONFIG: QueenCoordinatorConfig = {
   },
   enableFailover: true,
   maxDelegationAttempts: 3,
+  embeddingDim: EMBEDDING_DIM,
 };
 
 // =============================================================================
@@ -1019,13 +1023,14 @@ export class QueenCoordinator extends EventEmitter {
   private createSimpleEmbedding(text: string): Float32Array {
     // Hash-based embedding - lightweight and fast for local similarity matching
     // For production ML embeddings, use: import('agentic-flow').computeEmbedding
-    const embedding = new Float32Array(768);
+    const dim = this.config.embeddingDim;
+    const embedding = new Float32Array(dim);
     const words = text.toLowerCase().split(/\s+/);
 
     for (let i = 0; i < words.length; i++) {
       const word = words[i];
       for (let j = 0; j < word.length; j++) {
-        const idx = (word.charCodeAt(j) * (i + 1) * (j + 1)) % 768;
+        const idx = (word.charCodeAt(j) * (i + 1) * (j + 1)) % dim;
         embedding[idx] += 1 / words.length;
       }
     }

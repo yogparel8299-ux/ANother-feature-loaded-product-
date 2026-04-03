@@ -14,6 +14,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { EMBEDDING_DIM } from '../embedding-constants.js';
 
 // ============================================================================
 // Persistence Configuration
@@ -551,7 +552,7 @@ class LocalReasoningBank {
     queryEmbedding: number[],
     options: { k?: number; threshold?: number; type?: string }
   ): StoredPattern[] {
-    const { k = 5, threshold = 0.5, type } = options;
+    const { k = 5, threshold = 0.3, type } = options;
 
     // Filter by type if specified
     let candidates = type
@@ -583,11 +584,12 @@ class LocalReasoningBank {
   private cosineSim(a: number[], b: number[]): number {
     if (!a || !b || a.length === 0 || b.length === 0) return 0;
 
-    const len = Math.min(a.length, b.length);
+    const maxLen = Math.max(a.length, b.length);
     let dot = 0, normA = 0, normB = 0;
 
-    for (let i = 0; i < len; i++) {
-      const ai = a[i], bi = b[i];
+    for (let i = 0; i < maxLen; i++) {
+      const ai = a[i] ?? 0;
+      const bi = b[i] ?? 0;
       dot += ai * bi;
       normA += ai * ai;
       normB += bi * bi;
@@ -1045,7 +1047,8 @@ export function benchmarkAdaptation(iterations: number = 1000): {
   }
 
   const times: number[] = [];
-  const testEmbedding = Array.from({ length: 384 }, () => Math.random());
+  // ADR-0052: matches embedding config default
+  const testEmbedding = Array.from({ length: EMBEDDING_DIM }, () => Math.random());
 
   for (let i = 0; i < iterations; i++) {
     const start = performance.now();

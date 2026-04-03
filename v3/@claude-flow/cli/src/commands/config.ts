@@ -74,56 +74,61 @@ const getCommand: Command = {
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const key = ctx.flags.key as string || ctx.args[0];
 
-    // Default config values (loaded from actual config when available)
-    const configValues: Record<string, unknown> = {
-      'version': '3.0.0',
-      'v3Mode': true,
-      'swarm.topology': 'hybrid',
-      'swarm.maxAgents': 15,
-      'swarm.autoScale': true,
-      'memory.backend': 'hybrid',
-      'memory.cacheSize': 256,
-      'mcp.transport': 'stdio',
-      'agents.defaultType': 'coder',
-      'agents.maxConcurrent': 15
-    };
+    try {
+      if (!key) {
+        // Show all config
+        const configValues = configManager.getConfig(ctx.cwd);
+        if (ctx.flags.format === 'json') {
+          output.printJson(configValues);
+          return { success: true, data: configValues };
+        }
 
-    if (!key) {
-      // Show all config
-      if (ctx.flags.format === 'json') {
-        output.printJson(configValues);
+        output.writeln();
+        output.writeln(output.bold('Current Configuration'));
+        output.writeln();
+
+        const flat: Record<string, unknown> = {};
+        const walk = (obj: Record<string, unknown>, prefix = '') => {
+          for (const [k, v] of Object.entries(obj)) {
+            const path = prefix ? `${prefix}.${k}` : k;
+            if (v && typeof v === 'object' && !Array.isArray(v)) {
+              walk(v as Record<string, unknown>, path);
+            } else {
+              flat[path] = v;
+            }
+          }
+        };
+        walk(configValues);
+        output.printTable({
+          columns: [
+            { key: 'key', header: 'Key', width: 25 },
+            { key: 'value', header: 'Value', width: 30 }
+          ],
+          data: Object.entries(flat).map(([k, v]) => ({ key: k, value: String(v) }))
+        });
+
         return { success: true, data: configValues };
       }
 
-      output.writeln();
-      output.writeln(output.bold('Current Configuration'));
-      output.writeln();
+      const value = configManager.get(ctx.cwd, key);
 
-      output.printTable({
-        columns: [
-          { key: 'key', header: 'Key', width: 25 },
-          { key: 'value', header: 'Value', width: 30 }
-        ],
-        data: Object.entries(configValues).map(([k, v]) => ({ key: k, value: String(v) }))
-      });
+      if (value === undefined) {
+        output.printError(`Configuration key not found: ${key}`);
+        return { success: false, exitCode: 1 };
+      }
 
-      return { success: true, data: configValues };
-    }
+      if (ctx.flags.format === 'json') {
+        output.printJson({ key, value });
+      } else {
+        output.writeln(`${key} = ${value}`);
+      }
 
-    const value = configValues[key];
-
-    if (value === undefined) {
-      output.printError(`Configuration key not found: ${key}`);
+      return { success: true, data: { key, value } };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      output.printError(message);
       return { success: false, exitCode: 1 };
     }
-
-    if (ctx.flags.format === 'json') {
-      output.printJson({ key, value });
-    } else {
-      output.writeln(`${key} = ${value}`);
-    }
-
-    return { success: true, data: { key, value } };
   }
 };
 

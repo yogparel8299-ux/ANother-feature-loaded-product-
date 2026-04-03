@@ -352,7 +352,27 @@ export async function getHNSWIndex(options?: {
   dimensions?: number;
   forceRebuild?: boolean;
 }): Promise<HNSWIndex | null> {
-  const dimensions = options?.dimensions ?? 384;
+  // Read dimension from agentdb embedding config (single source of truth)
+    let dimensions = options?.dimensions;
+    if (!dimensions) {
+        try {
+            const _agentdbMod: any = await import('agentdb');
+            if (_agentdbMod.getEmbeddingConfig) {
+                dimensions = _agentdbMod.getEmbeddingConfig().dimension;
+            }
+        } catch { /* agentdb not available */ }
+        // EM-001: Fall back to embeddings.json
+        if (!dimensions) {
+            try {
+                const embConfigPath = path.join(process.cwd(), '.claude-flow', 'embeddings.json');
+                if (fs.existsSync(embConfigPath)) {
+                    const embConfig = JSON.parse(fs.readFileSync(embConfigPath, 'utf-8'));
+                    dimensions = embConfig.dimension || 768;
+                }
+            } catch { /* EM-001: embeddings.json may not exist — use defaults */ }
+        }
+        dimensions = dimensions || 768;
+    }
 
   // Return existing index if already initialized
   if (hnswIndex?.initialized && !options?.forceRebuild) {
@@ -396,6 +416,15 @@ export async function getHNSWIndex(options?: {
     const hnswPath = path.join(swarmDir, 'hnsw.index');
     const metadataPath = path.join(swarmDir, 'hnsw.metadata.json');
     const dbPath = options?.dbPath ? path.resolve(options.dbPath) : path.join(swarmDir, 'memory.db');
+    // EM-001: delete stale persistent files on forceRebuild
+    if (options?.forceRebuild) {
+        try {
+            if (fs.existsSync(hnswPath)) fs.unlinkSync(hnswPath);
+        } catch { /* EM-001: file cleanup */ }
+        try {
+            if (fs.existsSync(metadataPath)) fs.unlinkSync(metadataPath);
+        } catch { /* EM-001: file cleanup */ }
+    }
 
     // Create HNSW index with persistent storage
     // @ruvector/core uses string enum for distanceMetric: 'Cosine', 'Euclidean', 'DotProduct', 'Manhattan'
@@ -407,7 +436,7 @@ export async function getHNSWIndex(options?: {
 
     // Load metadata (entry info) if exists
     const entries = new Map<string, HNSWEntry>();
-    if (fs.existsSync(metadataPath)) {
+    if (!options?.forceRebuild && fs.existsSync(metadataPath)) {
       try {
         const metadataJson = fs.readFileSync(metadataPath, 'utf-8');
         const metadata = JSON.parse(metadataJson) as Array<[string, HNSWEntry]>;
@@ -428,7 +457,7 @@ export async function getHNSWIndex(options?: {
 
     // Check if index already has data (from persistent storage)
     const existingLen = await db.len();
-    if (existingLen > 0 && entries.size > 0) {
+    if (existingLen > 0 && entries.size > 0 && !options?.forceRebuild) {
       // Index loaded from disk, skip SQLite sync
       hnswIndex.initialized = true;
       hnswInitializing = false;
@@ -620,7 +649,7 @@ export function getHNSWStatus(): {
       available: true,
       initialized: true,
       entryCount: hnswIndex?.entries.size ?? 0,
-      dimensions: hnswIndex?.dimensions ?? 384
+      dimensions: hnswIndex?.dimensions ?? 768
     };
   }
 
@@ -628,7 +657,7 @@ export function getHNSWStatus(): {
     available: hnswIndex !== null,
     initialized: hnswIndex?.initialized ?? false,
     entryCount: hnswIndex?.entries.size ?? 0,
-    dimensions: hnswIndex?.dimensions ?? 384
+    dimensions: hnswIndex?.dimensions ?? 768
   };
 }
 
@@ -755,7 +784,7 @@ export function getQuantizationStats(embedding: number[] | Float32Array): {
 /**
  * Batch cosine similarity - compute query against multiple vectors
  * Optimized for V8 JIT with typed arrays
- * ~50μs per 1000 vectors (384-dim)
+ * ~50μs per 1000 vectors (768-dim)
  */
 export function batchCosineSim(
   query: Float32Array | number[],
@@ -1535,29 +1564,59 @@ export async function loadEmbeddingModel(options?: {
   }
 
   try {
+    // Read embedding model from agentdb config (single source of truth)
+    let modelName = 'nomic-ai/nomic-embed-text-v1.5';
+    let modelDimensions = 768;
+    try {
+        const _agentdbMod: any = await import('agentdb');
+        if (_agentdbMod.getEmbeddingConfig) {
+            const _embCfg = _agentdbMod.getEmbeddingConfig();
+            modelName = _embCfg.model;
+            modelDimensions = _embCfg.dimension;
+        }
+    } catch { /* agentdb not available */ }
+    // EM-001: Fall back to embeddings.json
+    if (modelName === 'nomic-ai/nomic-embed-text-v1.5') {
+        try {
+            const embConfigPath = path.join(process.cwd(), '.claude-flow', 'embeddings.json');
+            if (fs.existsSync(embConfigPath)) {
+                const embConfig = JSON.parse(fs.readFileSync(embConfigPath, 'utf-8'));
+                if (embConfig.model) {
+                    modelName = embConfig.model;
+                    modelDimensions = embConfig.dimension || 768;
+                }
+            }
+        } catch { /* EM-001: embeddings.json may not exist — use defaults */ }
+    }
+    // Models with org prefix (e.g. nomic-ai/...) keep their prefix; only bare names get Xenova/
+    const xenovaModel = modelName.includes('/') ? modelName : `Xenova/${modelName}`;
+    // EM-002: Set TRANSFORMERS_CACHE to user-writable path to prevent EACCES on global installs
+    if (!process.env.TRANSFORMERS_CACHE) {
+      const os = await import('os');
+      const path = await import('path');
+      process.env.TRANSFORMERS_CACHE = path.join(os.homedir(), '.cache', 'transformers');
+    }
     // Try to import @xenova/transformers for ONNX embeddings
-    const transformers = await import('@xenova/transformers').catch(() => null);
-
+    const transformers = await import('@xenova/transformers').catch(() => null); /* EM-001: optional dependency */
     if (transformers) {
       if (verbose) {
-        console.log('Loading ONNX embedding model (all-MiniLM-L6-v2)...');
+        console.log(`Loading ONNX embedding model (${modelName})...`);
       }
 
-      // Use small, fast model for local embeddings
       const { pipeline } = transformers;
-      const embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+      const embedder = await pipeline('feature-extraction', xenovaModel);
 
       embeddingModelState = {
         loaded: true,
         model: embedder,
         tokenizer: null,
-        dimensions: 384 // MiniLM-L6 produces 384-dim vectors
+        dimensions: modelDimensions
       };
 
       return {
         success: true,
-        dimensions: 384,
-        modelName: 'all-MiniLM-L6-v2',
+        dimensions: modelDimensions,
+        modelName: modelName,
         loadTime: Date.now() - startTime
       };
     }
@@ -1651,12 +1710,12 @@ export async function loadEmbeddingModel(options?: {
       loaded: true,
       model: null, // Will use simple hash-based fallback
       tokenizer: null,
-      dimensions: 128 // Smaller fallback dimensions
+      dimensions: 768 // Match HNSW index dimensions (hash fallback)
     };
 
     return {
       success: true,
-      dimensions: 128,
+      dimensions: 768,
       modelName: 'hash-fallback',
       loadTime: Date.now() - startTime
     };
@@ -1674,15 +1733,27 @@ export async function loadEmbeddingModel(options?: {
  * Generate real embedding for text
  * Uses ONNX model if available, falls back to deterministic hash
  */
-export async function generateEmbedding(text: string): Promise<{
+export async function generateEmbedding(
+  text: string,
+  options?: { intent?: 'query' | 'document' },
+): Promise<{
   embedding: number[];
   dimensions: number;
   model: string;
 }> {
+  // Apply model-specific task prefix via agentdb
+  let processedText = text;
+  try {
+    const _agentdbMod: any = await import('agentdb');
+    if (_agentdbMod.applyTaskPrefix) {
+      processedText = _agentdbMod.applyTaskPrefix(text, options?.intent || 'document');
+    }
+  } catch { /* no prefix available */ }
+
   // ADR-053: Try AgentDB v3 bridge first
   const bridge = await getBridge();
   if (bridge) {
-    const bridgeResult = await bridge.bridgeGenerateEmbedding(text);
+    const bridgeResult = await bridge.bridgeGenerateEmbedding(processedText);
     if (bridgeResult) return bridgeResult;
   }
 
@@ -1696,7 +1767,7 @@ export async function generateEmbedding(text: string): Promise<{
   // Use ONNX model if available
   if (state.model && typeof (state.model as any) === 'function') {
     try {
-      const output = await (state.model as any)(text, { pooling: 'mean', normalize: true });
+      const output = await (state.model as any)(processedText, { pooling: 'mean', normalize: true });
       // Handle both @xenova/transformers (output.data) and ruvector (plain array) formats
       const embedding = output?.data
         ? Array.from(output.data as Float32Array)
@@ -1714,7 +1785,7 @@ export async function generateEmbedding(text: string): Promise<{
   }
 
   // Deterministic hash-based fallback (for testing/demo without ONNX)
-  const embedding = generateHashEmbedding(text, state.dimensions);
+  const embedding = generateHashEmbedding(processedText, state.dimensions);
   return {
     embedding,
     dimensions: state.dimensions,
@@ -1816,6 +1887,28 @@ function generateHashEmbedding(text: string, dimensions: number): number[] {
   // Normalize to unit vector
   const magnitude = Math.sqrt(embedding.reduce((sum, v) => sum + v * v, 0)) || 1;
   return embedding.map(v => v / magnitude);
+}
+
+/**
+ * Get the appropriate similarity threshold for the current embedding model.
+ * Hash fallback embeddings produce similarity ~0.05-0.28 (not semantic).
+ * ONNX embeddings produce meaningful similarity 0.3-0.95.
+ *
+ * FB-004: Adaptive thresholds prevent silent empty results with hash embeddings.
+ */
+export async function getAdaptiveThreshold(explicitThreshold?: number): Promise<number> {
+  if (explicitThreshold !== undefined && explicitThreshold !== null) {
+    return explicitThreshold;
+  }
+  try {
+    const { model } = await generateEmbedding('threshold probe');
+    if (model === 'hash-fallback') {
+      return 0.05; // Hash: low threshold, ranking is noise
+    }
+    return 0.3; // ONNX: meaningful similarity scores
+  } catch {
+    return 0.05; // If embedding fails, use permissive threshold
+  }
 }
 
 /**
@@ -2043,7 +2136,10 @@ export async function storeEntry(options: {
   const bridge = await getBridge();
   if (bridge) {
     const bridgeResult = await bridge.bridgeStoreEntry(options);
-    if (bridgeResult) return bridgeResult;
+    // DB-007: Only accept bridge result on explicit success;
+    // null means DB unavailable, false success means a guard rejection etc.
+    // Either way, fall through to sql.js fallback.
+    if (bridgeResult && bridgeResult.success) return bridgeResult;
   }
 
   // Fallback: raw sql.js
@@ -2174,7 +2270,10 @@ export async function searchEntries(options: {
   const bridge = await getBridge();
   if (bridge) {
     const bridgeResult = await bridge.bridgeSearchEntries(options);
-    if (bridgeResult) return bridgeResult;
+    // DB-007: Only use bridge result if it actually found results;
+    // an empty { success: true, results: [] } is truthy but should
+    // fall through to the sql.js fallback for a second chance.
+    if (bridgeResult && bridgeResult.results && bridgeResult.results.length > 0) return bridgeResult;
   }
 
   // Fallback: raw sql.js
@@ -2182,9 +2281,11 @@ export async function searchEntries(options: {
     query,
     namespace,
     limit = 10,
-    threshold = 0.3,
+    threshold: explicitThreshold,
     dbPath: customPath
   } = options;
+  // FB-004: adaptive threshold based on embedding model
+  const threshold = await getAdaptiveThreshold(explicitThreshold);
   const effectiveNamespace = namespace || 'all';
 
   const swarmDir = path.resolve(process.cwd(), '.swarm');
@@ -2199,8 +2300,8 @@ export async function searchEntries(options: {
     // Ensure schema has all required columns (migration for older DBs)
     await ensureSchemaColumns(dbPath);
 
-    // Generate query embedding
-    const queryEmb = await generateEmbedding(query);
+    // Generate query embedding (intent: 'query' for model-specific prefix)
+    const queryEmb = await generateEmbedding(query, { intent: 'query' });
     const queryEmbedding = queryEmb.embedding;
 
     // Try HNSW search first (150x faster)
@@ -2300,7 +2401,7 @@ export async function searchEntries(options: {
 /**
  * Optimized cosine similarity
  * V8 JIT-friendly - avoids manual unrolling which can hurt performance
- * ~0.5μs per 384-dim vector comparison
+ * ~0.5μs per 768-dim vector comparison
  */
 function cosineSim(a: number[], b: number[]): number {
   if (!a || !b || a.length === 0 || b.length === 0) return 0;
@@ -2691,6 +2792,22 @@ export async function deleteEntry(options: {
         AND status = 'active'
     `, [key, namespace]);
 
+    // GV-001: Remove ghost vector from HNSW metadata file
+    try {
+        const swarmDir = path.join(process.cwd(), '.swarm');
+        const metadataPath = path.join(swarmDir, 'hnsw.metadata.json');
+        if (fs.existsSync(metadataPath)) {
+            const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf-8'));
+            const filtered = metadata.filter(([id]: [string, unknown]) => id !== entryId);
+            if (filtered.length < metadata.length) {
+                fs.writeFileSync(metadataPath, JSON.stringify(filtered));
+            }
+        }
+    } catch { /* GV-001: best-effort file cleanup — metadata file may not exist */ }
+    // GV-001: Also clear in-memory index if loaded
+    if (hnswIndex?.entries?.has(entryId)) {
+        hnswIndex.entries.delete(entryId);
+    }
     // Get remaining count
     const countResult = db.exec(`SELECT COUNT(*) FROM memory_entries WHERE status = 'active'`);
     const remainingEntries = countResult[0]?.values?.[0]?.[0] as number || 0;

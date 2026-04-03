@@ -15,6 +15,7 @@ import type {
   Trajectory,
   TrajectoryStep,
 } from '../types.js';
+import { EMBEDDING_DIM } from '../embedding-constants.js';
 
 /**
  * A2C configuration
@@ -75,7 +76,7 @@ export class A2CAlgorithm {
   private buffer: A2CExperience[] = [];
 
   // Dimensions
-  private inputDim = 768;
+  private inputDim: number;
   private hiddenDim = 64;
   private numActions = 4;
 
@@ -87,6 +88,7 @@ export class A2CAlgorithm {
 
   constructor(config: Partial<A2CConfig> = {}) {
     this.config = { ...DEFAULT_A2C_CONFIG, ...config };
+    this.inputDim = this.config.inputDim ?? EMBEDDING_DIM;
 
     // Initialize network
     const scale = Math.sqrt(2 / this.inputDim);

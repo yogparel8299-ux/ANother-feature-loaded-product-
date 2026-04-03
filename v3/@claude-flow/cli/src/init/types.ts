@@ -58,6 +58,14 @@ export interface HooksConfig {
   teammateIdle: boolean;
   /** Enable TaskCompleted hooks (agent teams pattern learning) */
   taskCompleted: boolean;
+  /** Enable PermissionRequest hooks */
+  permissionRequest?: boolean;
+  /** Allow hooks to degrade on bridge failure */
+  bridgeFallback?: boolean;
+  /** Master hooks enable switch (used in config.json generation) */
+  enabled?: boolean;
+  /** Auto-execute hooks */
+  autoExecute?: boolean;
   /** Hook timeout in milliseconds */
   timeout: number;
   /** Continue on hook error */
@@ -196,6 +204,52 @@ export interface RuntimeConfig {
   enableMemoryGraph?: boolean;
   /** Enable AgentMemoryScope (ADR-049) - 3-scope agent memory */
   enableAgentScopes?: boolean;
+  /** Swarm coordination strategy */
+  coordinationStrategy?: string;
+  /** Memory/embedding LRU cache size */
+  cacheSize?: number;
+  /** SONA access boost amount */
+  accessBoostAmount?: number;
+  /** Default agent memory scope */
+  defaultScope?: string;
+  /** Neural model path */
+  modelPath?: string;
+  /** Swarm auto-scale */
+  autoScale?: boolean;
+  /** Vector backend for AgentDB */
+  vectorBackend?: string;
+  /** Enable AgentDB learning */
+  enableLearning?: boolean;
+  /** AgentDB learning positive threshold */
+  learningPositiveThreshold?: number;
+  /** AgentDB learning negative threshold */
+  learningNegativeThreshold?: number;
+  /** AgentDB learning batch size */
+  learningBatchSize?: number;
+  /** AgentDB learning tick interval (ms) */
+  learningTickInterval?: number;
+  /** SONA mode */
+  sonaMode?: string;
+  /** Bridge init fallback */
+  bridgeInitFallback?: boolean;
+  /** Enable AgentDB learning (CLI flag) */
+  enableAgentdbLearning?: boolean;
+  /** AgentDB positive threshold (CLI flag) */
+  agentdbPositiveThreshold?: number;
+  /** AgentDB negative threshold (CLI flag) */
+  agentdbNegativeThreshold?: number;
+  /** AgentDB batch size (CLI flag) */
+  agentdbBatchSize?: number;
+  /** AgentDB tick interval (CLI flag) */
+  agentdbTickInterval?: number;
+  /** Max HNSW graph nodes (ADR-0030) */
+  maxNodes?: number;
+  /** HNSW similarity threshold (ADR-0030) */
+  similarityThreshold?: number;
+  /** Enable Flash Attention (ADR-0030) */
+  flashAttention?: boolean;
+  /** Max neural models to keep loaded (ADR-0030) */
+  maxModels?: number;
   /** CLAUDE.md template variant */
   claudeMdTemplate?: ClaudeMdTemplate;
 }
@@ -209,8 +263,10 @@ export type ClaudeMdTemplate = 'minimal' | 'standard' | 'full' | 'security' | 'p
 export interface EmbeddingsConfig {
   /** Enable embedding subsystem */
   enabled: boolean;
-  /** ONNX model ID */
-  model: 'all-MiniLM-L6-v2' | 'all-mpnet-base-v2' | 'bge-small-en-v1.5' | string;
+  /** Embedding model ID */
+  model: 'all-MiniLM-L6-v2' | 'all-mpnet-base-v2' | 'bge-small-en-v1.5' | 'nomic-ai/nomic-embed-text-v1.5' | string;
+  /** Embedding provider (transformers or onnx) */
+  provider?: 'transformers' | 'onnx' | string;
   /** Enable hyperbolic (Poincaré ball) embeddings */
   hyperbolic: boolean;
   /** Poincaré ball curvature (negative value, typically -1) */
@@ -391,7 +447,7 @@ export const DEFAULT_INIT_OPTIONS: InitOptions = {
     claudeFlow: true,
     ruvSwarm: false,
     flowNexus: false,
-    autoStart: false,
+    autoStart: true,
     port: 3000,
   },
   runtime: {
@@ -439,6 +495,12 @@ export const MINIMAL_INIT_OPTIONS: InitOptions = {
     teammateIdle: false,
     taskCompleted: false,
   },
+  // SG-001: statusline file not generated (components.statusline: false)
+  // so disable the feature flag to prevent dangling settings.json references
+  statusline: {
+    ...DEFAULT_INIT_OPTIONS.statusline,
+    enabled: false,
+  },
   skills: {
     core: true,
     agentdb: false,
@@ -464,14 +526,14 @@ export const MINIMAL_INIT_OPTIONS: InitOptions = {
     all: false,
   },
   runtime: {
-    topology: 'mesh',
-    maxAgents: 5,
-    memoryBackend: 'memory',
-    enableHNSW: false,
-    enableNeural: false,
-    enableLearningBridge: false,
-    enableMemoryGraph: false,
-    enableAgentScopes: false,
+    topology: 'hierarchical-mesh',
+    maxAgents: 15,
+    memoryBackend: 'hybrid',
+    enableHNSW: true,
+    enableNeural: true,
+    enableLearningBridge: true,
+    enableMemoryGraph: true,
+    enableAgentScopes: true,
   },
   embeddings: {
     enabled: false,
@@ -522,12 +584,23 @@ export const FULL_INIT_OPTIONS: InitOptions = {
     claudeFlow: true,
     ruvSwarm: true,
     flowNexus: true,
-    autoStart: false,
+    autoStart: true,
     port: 3000,
+  },
+  runtime: {
+    ...DEFAULT_INIT_OPTIONS.runtime,
+    cacheSize: 2048,
+    sonaMode: 'instant',
+    maxNodes: 50000,
+    similarityThreshold: 0.65,
+    learningBatchSize: 128,
+    learningTickInterval: 15000,
+    flashAttention: true,
+    maxModels: 5,
   },
   embeddings: {
     enabled: true,
-    model: 'all-MiniLM-L6-v2',
+    model: 'all-mpnet-base-v2',
     hyperbolic: true,
     curvature: -1.0,
     predownload: true,  // Pre-download for full init

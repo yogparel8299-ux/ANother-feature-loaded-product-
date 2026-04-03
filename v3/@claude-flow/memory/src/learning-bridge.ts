@@ -12,6 +12,7 @@
 import { EventEmitter } from 'node:events';
 import type { IMemoryBackend, MemoryEntry, SONAMode } from './types.js';
 import type { MemoryInsight, InsightCategory } from './auto-memory-bridge.js';
+import { EMBEDDING_DIM } from './embedding-constants.js';
 
 // ===== Types =====
 
@@ -39,6 +40,8 @@ export interface LearningBridgeConfig {
   consolidationThreshold?: number;
   /** Enable the bridge (default: true). When false all methods are no-ops */
   enabled?: boolean;
+  /** Embedding dimension for hash embeddings (default: 768) */
+  embeddingDim?: number;
   /**
    * Optional factory for the neural learning system.
    * When provided, this replaces the default dynamic import of @claude-flow/neural.
@@ -77,8 +80,9 @@ export interface PatternMatch {
 // ===== Defaults =====
 
 /** Internal resolved config type where neuralLoader stays optional */
-type ResolvedConfig = Required<Omit<LearningBridgeConfig, 'neuralLoader'>> & {
+type ResolvedConfig = Required<Omit<LearningBridgeConfig, 'neuralLoader' | 'embeddingDim'>> & {
   neuralLoader?: NeuralLoader;
+  embeddingDim: number;
 };
 
 const DEFAULT_CONFIG: ResolvedConfig = {
@@ -90,6 +94,7 @@ const DEFAULT_CONFIG: ResolvedConfig = {
   ewcLambda: 2000,
   consolidationThreshold: 10,
   enabled: true,
+  embeddingDim: EMBEDDING_DIM,
 };
 
 const MS_PER_HOUR = 3_600_000;
@@ -130,6 +135,24 @@ export class LearningBridge extends EventEmitter {
   }
 
   // ===== Public API =====
+
+  /**
+   * High-level learn entry point — records an insight and consolidates.
+   * Called by bridgeLearningBridgeLearn and hooks_intelligence_learn.
+   */
+  async learn(input: { content?: string; namespace?: string; [key: string]: unknown }): Promise<{ learned: boolean; stats?: any }> {
+    if (!this.config.enabled || this.destroyed) return { learned: false };
+    const insight: MemoryInsight = {
+      category: 'project-patterns',
+      summary: input.content || '',
+      confidence: 1.0,
+      source: 'learn-api',
+    };
+    const entryId = `learn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    await this.onInsightRecorded(insight, entryId);
+    await this.consolidate();
+    return { learned: true, stats: this.getStats() };
+  }
 
   /**
    * Notify the bridge that an insight has been recorded in AgentDB.
@@ -422,7 +445,7 @@ export class LearningBridge extends EventEmitter {
    * This is a lightweight stand-in for a real embedding model,
    * suitable for pattern matching within the neural trajectory system.
    */
-  private createHashEmbedding(text: string, dimensions: number = 768): Float32Array {
+  private createHashEmbedding(text: string, dimensions: number = this.config.embeddingDim): Float32Array {
     const embedding = new Float32Array(dimensions);
     const normalized = text.toLowerCase().trim();
 

@@ -16,6 +16,7 @@ import type {
   Trajectory,
   TrajectoryStep,
 } from '../types.js';
+import { EMBEDDING_DIM } from '../embedding-constants.js';
 
 /**
  * Default DQN configuration
@@ -72,7 +73,7 @@ export class DQNAlgorithm {
 
   // Number of actions
   private numActions = 4;
-  private inputDim = 768;
+  private inputDim: number;
 
   // Statistics
   private updateCount = 0;
@@ -80,6 +81,7 @@ export class DQNAlgorithm {
 
   constructor(config: Partial<DQNConfig> = {}) {
     this.config = { ...DEFAULT_DQN_CONFIG, ...config };
+    this.inputDim = this.config.inputDim ?? EMBEDDING_DIM;
     this.epsilon = this.config.explorationInitial;
 
     // Initialize Q-network (2 hidden layers)

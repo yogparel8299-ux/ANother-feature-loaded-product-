@@ -8,6 +8,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join, resolve } from 'path';
 import type { MCPTool } from './types.js';
+import { EMBEDDING_DIM } from './embedding-constants.js';
 
 // Configuration paths
 const CONFIG_DIR = '.claude-flow';
@@ -165,7 +166,7 @@ export const embeddingsTools: MCPTool[] = [
           type: 'string',
           description: 'ONNX model ID',
           enum: ['all-MiniLM-L6-v2', 'all-mpnet-base-v2'],
-          default: 'all-MiniLM-L6-v2',
+          default: 'all-mpnet-base-v2',
         },
         hyperbolic: {
           type: 'boolean',
@@ -190,7 +191,7 @@ export const embeddingsTools: MCPTool[] = [
       },
     },
     handler: async (input) => {
-      const model = (input.model as string) || 'all-MiniLM-L6-v2';
+      const model = (input.model as string) || 'all-mpnet-base-v2';
       const hyperbolic = input.hyperbolic !== false;
       const curvature = (input.curvature as number) || -1;
       const cacheSize = (input.cacheSize as number) || 256;
@@ -208,7 +209,8 @@ export const embeddingsTools: MCPTool[] = [
         };
       }
 
-      const dimension = model.includes('mpnet') ? 768 : 384;
+      // ADR-0052: use EMBEDDING_DIM as default, MiniLM is 384
+      const dimension = model.includes('MiniLM') ? 384 : EMBEDDING_DIM;
       const modelPath = resolve(join(CONFIG_DIR, MODELS_DIR));
 
       // Create models directory

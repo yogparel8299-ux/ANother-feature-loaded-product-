@@ -1,3 +1,4 @@
+// CI-TEST: pipeline validation
 /**
  * V3 CLI Type Definitions
  * Modernized type system for the RuFlo V3 CLI
@@ -285,3 +286,6 @@ export class CommandNotFoundError extends CLIError {
     this.name = 'CommandNotFoundError';
   }
 }
+// trigger 1773498980
+// t1773499077
+// t1773499189

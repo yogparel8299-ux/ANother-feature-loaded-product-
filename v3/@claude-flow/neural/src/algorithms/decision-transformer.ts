@@ -15,6 +15,7 @@ import type {
   Trajectory,
   TrajectoryStep,
 } from '../types.js';
+import { EMBEDDING_DIM } from '../embedding-constants.js';
 
 /**
  * Default Decision Transformer configuration
@@ -69,7 +70,7 @@ export class DecisionTransformer {
   private trajectoryBuffer: Trajectory[] = [];
 
   // Dimensions
-  private stateDim = 768;
+  private stateDim: number;
   private numActions = 4;
 
   // Statistics
@@ -78,6 +79,7 @@ export class DecisionTransformer {
 
   constructor(config: Partial<DecisionTransformerConfig> = {}) {
     this.config = { ...DEFAULT_DT_CONFIG, ...config };
+    this.stateDim = this.config.inputDim ?? EMBEDDING_DIM;
 
     // Initialize embeddings
     this.stateEmbed = this.initEmbedding(this.stateDim, this.config.embeddingDim);

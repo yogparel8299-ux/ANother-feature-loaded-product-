@@ -15,6 +15,7 @@
 import type { MCPTool } from './types.js';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { EMBEDDING_DIM } from './embedding-constants.js';
 
 // Try to import real embeddings — prefer agentic-flow v3 ReasoningBank, then @claude-flow/embeddings
 let realEmbeddings: { embed: (text: string) => Promise<number[]> } | null = null;
@@ -73,7 +74,7 @@ interface NeuralModel {
   config: Record<string, unknown>;
 }
 
-interface Pattern {
+export interface Pattern {
   id: string;
   name: string;
   type: string;
@@ -104,7 +105,7 @@ function ensureNeuralDir(): void {
   }
 }
 
-function loadNeuralStore(): NeuralStore {
+export function loadNeuralStore(): NeuralStore {
   try {
     const path = getNeuralPath();
     if (existsSync(path)) {
@@ -116,13 +117,14 @@ function loadNeuralStore(): NeuralStore {
   return { models: {}, patterns: {}, version: '3.0.0' };
 }
 
-function saveNeuralStore(store: NeuralStore): void {
+export function saveNeuralStore(store: NeuralStore): void {
   ensureNeuralDir();
   writeFileSync(getNeuralPath(), JSON.stringify(store, null, 2), 'utf-8');
 }
 
 // Generate embedding - uses real embeddings if available, falls back to hash-based
-async function generateEmbedding(text?: string, dims: number = 384): Promise<number[]> {
+// ADR-0052: matches embedding config default
+export async function generateEmbedding(text?: string, dims: number = EMBEDDING_DIM): Promise<number[]> {
   // If real embeddings available and text provided, use them
   if (realEmbeddings && text) {
     try {
@@ -326,7 +328,8 @@ export const neuralTools: MCPTool[] = [
         const patternName = (input.name as string) || 'Unnamed pattern';
 
         // Generate embedding from pattern name/content
-        const embedding = await generateEmbedding(patternName, 384);
+        // ADR-0052: matches embedding config default
+        const embedding = await generateEmbedding(patternName, EMBEDDING_DIM);
 
         const pattern: Pattern = {
           id: patternId,
@@ -356,7 +359,8 @@ export const neuralTools: MCPTool[] = [
         const query = input.query as string;
 
         // Generate query embedding for real similarity search
-        const queryEmbedding = await generateEmbedding(query, 384);
+        // ADR-0052: matches embedding config default
+        const queryEmbedding = await generateEmbedding(query, EMBEDDING_DIM);
 
         // Calculate REAL cosine similarity against stored patterns
         const results = Object.values(store.patterns)
@@ -472,7 +476,7 @@ export const neuralTools: MCPTool[] = [
             acc[p.type] = (acc[p.type] || 0) + 1;
             return acc;
           }, {} as Record<string, number>),
-          totalEmbeddingDims: patterns.length > 0 ? patterns[0].embedding.length : 384,
+          totalEmbeddingDims: patterns.length > 0 ? patterns[0].embedding.length : EMBEDDING_DIM, // ADR-0052: matches embedding config default
         },
         features: {
           hnsw: true,

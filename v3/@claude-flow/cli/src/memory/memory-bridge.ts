@@ -17,8 +17,50 @@
  * @module v3/cli/memory-bridge
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+// ===== WM-102: Read config.json for ControllerRegistry =====
+function readProjectConfig(): any {
+    try {
+        const cfgPath = path.join(process.cwd(), '.claude-flow', 'config.json');
+        if (fs.existsSync(cfgPath)) {
+            return JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+        }
+    } catch { /* WM-102: config.json may not exist or may be malformed — use defaults */ }
+    return {};
+}
+
+// FB-004 + OPT-009: Adaptive threshold based on embedding model + dimensions.
+// Hash fallback produces similarity ~0.05-0.28 (not semantic).
+// 384-dim (reasoningbank) produces lower cosine scores than 768-dim ONNX.
+const THRESHOLDS: Record<string, number> = {
+  'hash-fallback': 0.05,
+  'onnx-384':      0.2,    // OPT-009: 384-dim reasoningbank embeddings
+  'onnx-768':      0.3,    // Full ONNX model (Sentence-BERT 768-dim)
+};
+const QUANTIZATION_THRESHOLD = 50_000; // ADR-0047: switch to quantized backend above this entry count
+let _detectedModel: string | null = null;
+let _detectedDimensions: number = 0;
+
+async function _getAdaptiveThreshold(explicit?: number): Promise<number> {
+  if (explicit !== undefined && explicit !== null) return explicit;
+  if (!_detectedModel) {
+    try {
+      // Probe the embedding model once and cache
+      const { generateEmbedding } = await import('./memory-initializer.js');
+      const { model, dimensions } = await generateEmbedding('probe');
+      _detectedModel = model;
+      _detectedDimensions = dimensions;
+    } catch {
+      _detectedModel = 'hash-fallback';
+      _detectedDimensions = 0;
+    }
+  }
+  if (_detectedModel === 'hash-fallback') return THRESHOLDS['hash-fallback'];
+  if (_detectedDimensions <= 384) return THRESHOLDS['onnx-384'];
+  return THRESHOLDS['onnx-768'];
+}
 
 // ===== Lazy singleton =====
 
@@ -60,45 +102,131 @@ async function getRegistry(dbPath?: string): Promise<any | null> {
 
   if (registryInstance) return registryInstance;
 
+  // WM-102c: Respect neural.enabled from config.json
+  const _neuralCfg = readProjectConfig().neural || {};
+  if (_neuralCfg.enabled === false) {
+      bridgeAvailable = false;
+      return null;
+  }
   if (!registryPromise) {
     registryPromise = (async () => {
       try {
         const { ControllerRegistry } = await import('@claude-flow/memory');
         const registry = new ControllerRegistry();
 
-        // Suppress noisy console.log during init
+        // Suppress ALL console.log during registry init to prevent controller
+        // logs (GNN, Sona, WASM, LearningSystem) from polluting MCP tool output.
+        // ADR-0048: comprehensive filter for 42-controller init noise.
+        //
+        // IMPORTANT: Console must stay suppressed through deferred init (Levels 2-6),
+        // not just the eager init (Levels 0-1). The deferred init runs as a background
+        // promise inside initialize() and controller factories (SemanticRouter, Sona,
+        // GNN) log during their construction. Restoring console only after
+        // 'deferred:initialized' fires prevents log leakage into MCP tool output.
         const origLog = console.log;
-        console.log = (...args: unknown[]) => {
-          const msg = String(args[0] ?? '');
-          if (msg.includes('Transformers.js') ||
-              msg.includes('better-sqlite3') ||
-              msg.includes('[AgentDB]') ||
-              msg.includes('[HNSWLibBackend]') ||
-              msg.includes('RuVector graph')) return;
-          origLog.apply(console, args);
+        const origWarn = console.warn;
+        let _consoleRestored = false;
+        const _restoreConsole = () => {
+          if (_consoleRestored) return;
+          _consoleRestored = true;
+          console.log = origLog;
+          console.warn = origWarn;
         };
+        console.log = (..._args: unknown[]) => { /* suppress all during init */ };
+        console.warn = (..._args: unknown[]) => { /* suppress all during init */ };
+
+        // Get dimension + model from agentdb embedding config (single source of truth)
+        let _embDimension = 768; // safe default
+        let _embModelName = 'nomic-ai/nomic-embed-text-v1.5';
+        try {
+          const _agentdbCfg: any = await import('agentdb');
+          if (_agentdbCfg.getEmbeddingConfig) {
+            const _ec = _agentdbCfg.getEmbeddingConfig();
+            _embDimension = _ec.dimension;
+            _embModelName = _ec.model;
+          }
+        } catch { /* agentdb not available, use default */ }
 
         try {
+          // WM-102b: wire config.json into ControllerRegistry
+          const _cfg = readProjectConfig();
+          const _mem = _cfg.memory || {};
+          const _lb = _mem.learningBridge || {};
+          const _mg = _mem.memoryGraph || {};
+          const _neural = _cfg.neural || {};
+
+          // Listen for deferred init completion to restore console AFTER all
+          // controller factories (Levels 2-6) have finished logging.
+          // Safety timeout ensures console is always restored even if the
+          // deferred init hangs or the event never fires.
+          const _deferredTimeout = setTimeout(_restoreConsole, 120_000);
+          (registry as any).once('deferred:initialized', () => {
+            clearTimeout(_deferredTimeout);
+            _restoreConsole();
+          });
+
           await registry.initialize({
             dbPath: dbPath || getDbPath(),
-            dimension: 384,
+            dimension: _embDimension,
+            enableHNSW: _mem.enableHNSW !== false,
+            cacheSize: _mem.cacheSize || 2048,
+            similarityThreshold: _mg.similarityThreshold || 0.65,
             controllers: {
               reasoningBank: true,
-              learningBridge: false,
+              learningBridge: _lb.enabled !== false,
               tieredCache: true,
               hierarchicalMemory: true,
               memoryConsolidation: true,
+              enhancedEmbedding: true,  // WM-111: wire EnhancedEmbeddingService
               memoryGraph: true, // issue #1214: enable MemoryGraph for graph-aware ranking
             },
+            memory: {
+              enableHNSW: _mem.enableHNSW !== false,
+              cacheSize: _mem.cacheSize || 2048,
+              learningBridge: {
+                sonaMode: _lb.sonaMode || 'real-time',
+                confidenceDecayRate: _lb.confidenceDecayRate || 0.005,
+                accessBoostAmount: _lb.accessBoostAmount || 0.03,
+                consolidationThreshold: _lb.consolidationThreshold || 10,
+              },
+              memoryGraph: {
+                pageRankDamping: _mg.pageRankDamping || 0.85,
+                maxNodes: _mg.maxNodes || 50000,
+                similarityThreshold: _mg.similarityThreshold || 0.65,
+              },
+            },
+          } as any);
+
+          // If there are no deferred levels (all eager), the 'deferred:initialized'
+          // event won't fire. Schedule a short fallback restore after a microtask to
+          // let the deferred promise start if it exists, then restore if it didn't.
+          void Promise.resolve().then(() => {
+            setTimeout(_restoreConsole, 500);
           });
-        } finally {
-          console.log = origLog;
+        } catch {
+          // Restore console on init failure so we don't permanently suppress output.
+          _restoreConsole();
+          throw new Error('registry init failed');
         }
 
         registryInstance = registry;
         bridgeAvailable = true;
+        // WM-115a: Instantiate WASMVectorSearch (JS fallback)
+        try {
+          const agentdbMod: any = await import('agentdb');
+          const WASMVectorSearch = agentdbMod.WASMVectorSearch || agentdbMod.default?.WASMVectorSearch;
+          if (WASMVectorSearch) {
+            const wasmSearch = new WASMVectorSearch({
+              dimension: _embDimension,
+              wasmAvailable: false, // JS fallback active
+            });
+            registry.register('wasmVectorSearch', wasmSearch);
+          }
+        } catch {
+          // WM-115: WASMVectorSearch instantiation failed — non-fatal
+        }
         return registry;
-      } catch {
+      } catch { /* WM-115: bridge may not be loaded — agentdb is an optional dependency */
         bridgeAvailable = false;
         registryPromise = null;
         return null;
@@ -107,6 +235,19 @@ async function getRegistry(dbPath?: string): Promise<any | null> {
   }
 
   return registryPromise;
+}
+// WM-115b: Expose computeSimilarity helper using WASMVectorSearch JS fallback
+async function wasmComputeSimilarity(vecA: Float32Array, vecB: Float32Array): Promise<number | null> {
+  if (!registryInstance) return null;
+  try {
+    const wasmSearch = registryInstance.get('wasmVectorSearch');
+    if (wasmSearch && typeof (wasmSearch as any).computeSimilarity === 'function') {
+      return (wasmSearch as any).computeSimilarity(vecA, vecB);
+    }
+  } catch {
+    // WM-115: computeSimilarity failed — non-fatal
+  }
+  return null;
 }
 
 // ===== Phase 2: BM25 hybrid scoring =====
@@ -261,6 +402,146 @@ async function logAttestation(
   }
 }
 
+// ===== ADR-0049: Fail-Loud Bridge Errors =====
+
+/** Thrown when a required controller is not available (strict mode) */
+export class ControllerNotAvailable extends Error {
+  controllerName: string;
+  bridgeFunction: string;
+  constructor(controllerName: string, bridgeFunction: string) {
+    super(`Controller '${controllerName}' not available (called from ${bridgeFunction})`);
+    this.name = 'ControllerNotAvailable';
+    this.controllerName = controllerName;
+    this.bridgeFunction = bridgeFunction;
+  }
+}
+
+/** ADR-0049: strict mode — throws on missing controllers instead of returning fallback */
+const BRIDGE_STRICT = process.env.CLAUDE_FLOW_STRICT !== 'false';
+
+/** ADR-0049: log missing controller in non-strict mode */
+function logMissingController(name: string, bridgeFn: string): void {
+  if (typeof process !== 'undefined' && process.env?.CLAUDE_FLOW_STRICT_QUIET !== 'true') {
+    console.warn(`[ADR-0049] Controller '${name}' not available in ${bridgeFn}`);
+  }
+}
+
+/** ADR-0049: assert controller exists, throw or log based on strict mode */
+function requireController<T>(ctrl: T | null | undefined, name: string, bridgeFn: string): T | null {
+  if (ctrl) return ctrl;
+  if (BRIDGE_STRICT) throw new ControllerNotAvailable(name, bridgeFn);
+  logMissingController(name, bridgeFn);
+  return null;
+}
+
+// ===== ADR-0041: Safeguards 1-4 shared wrapper =====
+
+/**
+ * Wrap a bridge call with ADR-0041 safeguards:
+ *  1. try-catch + timeout (default 2s)
+ *  2. Cold-start guard (skip if controller has insufficient data)
+ *  3. Max writes per call (default 3, enforced per invocation)
+ *  4. Fire-and-forget for background writes (returns immediately)
+ *
+ * @param fn - The bridge operation to execute
+ * @param opts - Safeguard options
+ * @returns The result of fn, or opts.fallback on failure/timeout
+ */
+export async function withBridgeSafeguards<T>(
+  fn: () => Promise<T>,
+  opts: {
+    timeoutMs?: number;
+    coldStartCheck?: () => boolean;
+    maxWrites?: number;
+    writeCounter?: { count: number };
+    fireAndForget?: boolean;
+    fallback?: T;
+  } = {},
+): Promise<T | undefined> {
+  const {
+    timeoutMs = 2000,
+    coldStartCheck,
+    maxWrites = 3,
+    writeCounter,
+    fireAndForget = false,
+    fallback,
+  } = opts;
+
+  // Safeguard 2: Cold-start guard
+  if (coldStartCheck && !coldStartCheck()) {
+    return fallback;
+  }
+
+  // Safeguard 3: Write limit
+  if (writeCounter && writeCounter.count >= maxWrites) {
+    return fallback;
+  }
+
+  // Safeguard 4: Fire-and-forget (non-blocking background write)
+  if (fireAndForget) {
+    fn().then(
+      () => { if (writeCounter) writeCounter.count++; },
+      () => { /* swallow — fire-and-forget */ },
+    );
+    return fallback;
+  }
+
+  // Safeguard 1: try-catch + timeout
+  try {
+    const result = await Promise.race([
+      fn(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('bridge_timeout')), timeoutMs),
+      ),
+    ]);
+    if (writeCounter) writeCounter.count++;
+    return result;
+  } catch {
+    return fallback;
+  }
+}
+
+// ===== ADR-0042: Security & Reliability helpers =====
+
+/**
+ * Check rate limit before forwarding operation.
+ * Returns null if allowed, or { error, retryAfter } if rate limited.
+ */
+async function bridgeCheckRateLimit(
+  registry: any,
+  operation: string,
+): Promise<{ error: string; retryAfter: number } | null> {
+  try {
+    const limiter = registry.get('rateLimiter');
+    if (!limiter || typeof limiter.tryConsume !== 'function') return null; // No limiter = allow
+    if (limiter.tryConsume(operation)) return null; // Token acquired
+    const retryAfter = typeof limiter.getRetryAfter === 'function'
+      ? limiter.getRetryAfter(operation)
+      : 1000;
+    return { error: 'rate_limited', retryAfter };
+  } catch {
+    return null; // Non-fatal
+  }
+}
+
+/**
+ * Check resource limits before heavy operations.
+ * Returns null if allowed, or { error } if over limit.
+ */
+async function bridgeCheckResources(
+  registry: any,
+): Promise<{ error: string } | null> {
+  try {
+    const tracker = registry.get('resourceTracker');
+    if (!tracker || typeof tracker.isOverLimit !== 'function') return null;
+    if (tracker.isOverLimit()) return { error: 'resource_limit_exceeded' };
+    if (typeof tracker.recordQuery === 'function') tracker.recordQuery();
+    return null;
+  } catch {
+    return null; // Non-fatal
+  }
+}
+
 /**
  * Get the AgentDB database handle and ensure memory_entries table exists.
  * Returns null if not available.
@@ -335,6 +616,10 @@ export async function bridgeStoreEntry(options: {
   const ctx = getDb(registry);
   if (!ctx) return null;
 
+    // ADR-0042: Rate limit check before store
+    const rateCheck = await bridgeCheckRateLimit(registry, 'insert');
+    if (rateCheck) return { success: false, id: '', error: rateCheck.error, retryAfter: rateCheck.retryAfter } as any;
+
   try {
     const { key, value, namespace = 'default', tags = [], ttl } = options;
     const id = generateId('entry');
@@ -346,26 +631,79 @@ export async function bridgeStoreEntry(options: {
       return { success: false, id, error: `MutationGuard rejected: ${guardResult.reason}` };
     }
 
-    // Generate embedding via AgentDB's embedder
+    // ADR-0030: Generate embedding via memory-initializer (768-dim preferred)
+    // instead of AgentDB's embedder (384-dim) to ensure consistent dimensions
     let embeddingJson: string | null = null;
     let dimensions = 0;
     let model = 'local';
 
     if (options.generateEmbeddingFlag !== false && value.length > 0) {
       try {
-        const embedder = ctx.agentdb.embedder;
-        if (embedder) {
-          const emb = await embedder.embed(value);
-          if (emb) {
-            embeddingJson = JSON.stringify(Array.from(emb));
-            dimensions = emb.length;
-            model = 'Xenova/all-MiniLM-L6-v2';
-          }
+        const { generateEmbedding } = await import('./memory-initializer.js');
+        const result = await generateEmbedding(value);
+        if (result && result.embedding) {
+          embeddingJson = JSON.stringify(result.embedding);
+          dimensions = result.dimensions;
+          model = result.model;
         }
       } catch {
-        // Embedding failed — store without
+        // Fallback to AgentDB embedder if memory-initializer unavailable
+        try {
+          const embedder = ctx.agentdb.embedder;
+          if (embedder) {
+            const emb = await embedder.embed(value);
+            if (emb) {
+              embeddingJson = JSON.stringify(Array.from(emb));
+              dimensions = emb.length;
+              // Read model name from centralized config instead of hardcoding
+              try {
+                const agentdbMod: any = await import('agentdb');
+                if (typeof agentdbMod.getEmbeddingConfig === 'function') {
+                  model = agentdbMod.getEmbeddingConfig().model || 'nomic-ai/nomic-embed-text-v1.5';
+                }
+              } catch {
+                model = 'nomic-ai/nomic-embed-text-v1.5';
+              }
+            }
+          }
+        } catch {
+          // Embedding failed — store without
+        }
       }
     }
+
+    // Phase 5: GuardedVectorBackend — store through guarded backend if available
+    try {
+      const gvb = registry?.getController?.('guardedVectorBackend') ?? registry?.get?.('guardedVectorBackend');
+      if (gvb && typeof gvb.store === 'function') {
+        const guardedResult = await Promise.race([
+          gvb.store({
+            key,
+            value,
+            namespace,
+            embedding: embeddingJson ? JSON.parse(embeddingJson) : undefined,
+          }),
+          new Promise<any>((_, reject) => setTimeout(() => reject(new Error('GuardedVector store timeout')), 2000))
+        ]);
+        if (guardedResult?.success) {
+          // GuardedVectorBackend handled the store — still do post-store hooks below
+          const safeNs = String(namespace).replace(/:/g, '_');
+          const safeKey = String(key).replace(/:/g, '_');
+          const cacheKey = `entry:${safeNs}:${safeKey}`;
+          await cacheSet(registry, cacheKey, { id, key, namespace, content: value, embedding: embeddingJson });
+          await logAttestation(registry, 'store', id, { key, namespace, hasEmbedding: !!embeddingJson, backend: 'guardedVector' });
+          return {
+            success: true,
+            id: guardedResult.id || id,
+            embedding: embeddingJson ? { dimensions, model } : undefined,
+            guarded: true,
+            cached: true,
+            attested: true,
+          };
+        }
+        // If guarded store fails, fall through to regular path
+      }
+    } catch { /* GuardedVectorBackend unavailable — use regular path */ }
 
     // better-sqlite3 uses synchronous .run() with positional params
     const insertSql = options.upsert
@@ -398,6 +736,13 @@ export async function bridgeStoreEntry(options: {
 
     // Phase 4: AttestationLog write audit
     await logAttestation(registry, 'store', id, { key, namespace, hasEmbedding: !!embeddingJson });
+
+    // Flush sql.js WASM memory to disk (sql.js stores in WASM heap, not on disk).
+    // Without this, data is lost when the CLI process exits or is killed by _run_and_kill.
+    // better-sqlite3 writes directly to disk via WAL, so save() is a no-op for native.
+    try {
+      if (typeof ctx.db.save === 'function') ctx.db.save();
+    } catch { /* best-effort flush */ }
 
     return {
       success: true,
@@ -443,22 +788,70 @@ export async function bridgeSearchEntries(options: {
   const ctx = getDb(registry);
   if (!ctx) return null;
 
+    // ADR-0042: Rate limit check before search
+    const rateCheck = await bridgeCheckRateLimit(registry, 'search');
+    if (rateCheck) return null;
+
   try {
-    const { query: queryStr, namespace, limit = 10, threshold = 0.3 } = options;
+    const { query: queryStr, namespace, limit = 10, threshold: explicitThreshold } = options;
+    const threshold = await _getAdaptiveThreshold(explicitThreshold);
     const effectiveNamespace = namespace || 'all';
     const startTime = Date.now();
 
-    // Generate query embedding
+    // ADR-0030: Generate query embedding via memory-initializer (768-dim preferred)
     let queryEmbedding: number[] | null = null;
     try {
-      const embedder = ctx.agentdb.embedder;
-      if (embedder) {
-        const emb = await embedder.embed(queryStr);
-        queryEmbedding = Array.from(emb);
+      const { generateEmbedding } = await import('./memory-initializer.js');
+      const result = await generateEmbedding(queryStr);
+      if (result && result.embedding) {
+        queryEmbedding = result.embedding;
       }
     } catch {
-      // Fall back to keyword search
+      // Fallback to AgentDB embedder
+      try {
+        const embedder = ctx.agentdb.embedder;
+        if (embedder) {
+          const emb = await embedder.embed(queryStr);
+          queryEmbedding = Array.from(emb);
+        }
+      } catch {
+        // Fall back to keyword search
+      }
     }
+
+    // Phase 5: GuardedVectorBackend — try guarded search first
+    try {
+      const gvb = registry?.getController?.('guardedVectorBackend') ?? registry?.get?.('guardedVectorBackend');
+      if (gvb && typeof gvb.search === 'function') {
+        const guardedResults = await Promise.race([
+          gvb.search({
+            query: queryStr,
+            namespace: namespace || undefined,
+            limit: limit,
+            embedding: queryEmbedding,
+          }),
+          new Promise<any>((_, reject) => setTimeout(() => reject(new Error('GuardedVector search timeout')), 2000))
+        ]);
+        if (guardedResults?.results?.length > 0) {
+          // GuardedVectorBackend results have cryptographic integrity guarantees
+          // Return them directly with provenance marking
+          const guardedMapped = guardedResults.results.slice(0, limit).map((r: any) => ({
+            id: String(r.id || r.key || '').substring(0, 12),
+            key: r.key || String(r.id || '').substring(0, 15),
+            content: (r.content || r.value || '').substring(0, 60) + ((r.content || r.value || '').length > 60 ? '...' : ''),
+            score: r.score ?? r.similarity ?? 0,
+            namespace: r.namespace || namespace || 'default',
+            provenance: `guarded-vector:${(r.score ?? r.similarity ?? 0).toFixed(3)}`,
+          }));
+          return {
+            success: true,
+            results: guardedMapped,
+            searchTime: Date.now() - startTime,
+            searchMethod: 'guarded-vector',
+          };
+        }
+      }
+    } catch { /* GuardedVectorBackend unavailable — fall through to regular path */ }
 
     // better-sqlite3: .prepare().all() returns array of objects
     const nsFilter = effectiveNamespace !== 'all'
@@ -530,10 +923,14 @@ export async function bridgeSearchEntries(options: {
     }
 
     results.sort((a, b) => b.score - a.score);
+    const sliced = results.slice(0, limit);
+
+    // Phase 5-D: GraphTransformer proof-gated re-ranking (optional overlay)
+    const reranked = await bridgeGraphTransformerRerank(sliced, queryStr);
 
     return {
       success: true,
-      results: results.slice(0, limit),
+      results: reranked,
       searchTime: Date.now() - startTime,
       searchMethod: queryEmbedding ? 'hybrid-bm25-semantic' : 'bm25-only',
     };
@@ -755,6 +1152,10 @@ export async function bridgeDeleteEntry(options: {
   const ctx = getDb(registry);
   if (!ctx) return null;
 
+    // ADR-0042: Rate limit check before delete
+    const rateCheck = await bridgeCheckRateLimit(registry, 'delete');
+    if (rateCheck) return { success: false, deleted: false, key: options.key, namespace: options.namespace || 'default', remainingEntries: 0, error: rateCheck.error } as any;
+
   try {
     const { key, namespace = 'default' } = options;
 
@@ -812,7 +1213,9 @@ export async function bridgeDeleteEntry(options: {
 
 /**
  * Generate embedding via AgentDB v3's embedder.
- * Returns null if bridge unavailable — caller falls back to own ONNX/hash.
+ * Returns null if bridge unavailable or dimensions don't match 768 —
+ * caller falls back to own ONNX/hash which produces correct 768-dim.
+ * ADR-0030: Reject 384-dim embeddings to ensure dimension consistency.
  */
 export async function bridgeGenerateEmbedding(
   text: string,
@@ -829,10 +1232,19 @@ export async function bridgeGenerateEmbedding(
     const emb = await embedder.embed(text);
     if (!emb) return null;
 
+    // Read expected dimension from config — don't hardcode
+    let expectedDim = 768;
+    let reportedModel = 'unknown';
+    try {
+      const _m: any = await import('agentdb');
+      if (_m.getEmbeddingConfig) { const _c = _m.getEmbeddingConfig(); expectedDim = _c.dimension; reportedModel = _c.model; }
+    } catch { /* use defaults */ }
+    if (emb.length !== expectedDim) return null;
+
     return {
       embedding: Array.from(emb),
       dimensions: emb.length,
-      model: 'Xenova/all-MiniLM-L6-v2',
+      model: reportedModel,
     };
   } catch {
     return null;
@@ -867,7 +1279,7 @@ export async function bridgeLoadEmbeddingModel(
     return {
       success: true,
       dimensions: test.length,
-      modelName: 'Xenova/all-MiniLM-L6-v2',
+      modelName: await import('agentdb').then((m: any) => m.getEmbeddingConfig?.()?.model || 'unknown').catch(() => 'unknown'),
       loadTime: Date.now() - startTime,
     };
   } catch {
@@ -907,11 +1319,13 @@ export async function bridgeGetHNSWStatus(
       // Table might not exist
     }
 
+    // Read actual dimension from registry config instead of hardcoding
+    const dim = (registry as any).config?.dimension || 768;
     return {
       available: true,
       initialized: true,
       entryCount,
-      dimensions: 384,
+      dimensions: dim,
     };
   } catch {
     return null;
@@ -942,7 +1356,7 @@ export async function bridgeSearchHNSW(
 
   try {
     const k = options?.k ?? 10;
-    const threshold = options?.threshold ?? 0.3;
+    const threshold = await _getAdaptiveThreshold(options?.threshold);
     const nsFilter = options?.namespace && options.namespace !== 'all'
       ? `AND namespace = ?`
       : '';
@@ -1012,15 +1426,23 @@ export async function bridgeAddToHNSW(
   try {
     const now = Date.now();
     const embeddingJson = JSON.stringify(embedding);
+    // Read model name from centralized config instead of hardcoding
+    let embeddingModel = 'nomic-ai/nomic-embed-text-v1.5';
+    try {
+      const agentdbMod: any = await import('agentdb');
+      if (typeof agentdbMod.getEmbeddingConfig === 'function') {
+        embeddingModel = agentdbMod.getEmbeddingConfig().model || embeddingModel;
+      }
+    } catch { /* agentdb not available — use default */ }
     ctx.db.prepare(`
       INSERT OR REPLACE INTO memory_entries (
         id, key, namespace, content, type,
         embedding, embedding_dimensions, embedding_model,
         created_at, updated_at, status
-      ) VALUES (?, ?, ?, ?, 'semantic', ?, ?, 'Xenova/all-MiniLM-L6-v2', ?, ?, 'active')
+      ) VALUES (?, ?, ?, ?, 'semantic', ?, ?, ?, ?, ?, 'active')
     `).run(
       id, entry.key, entry.namespace, entry.content,
-      embeddingJson, embedding.length,
+      embeddingJson, embedding.length, embeddingModel,
       now, now,
     );
     return true;
@@ -1043,6 +1465,10 @@ export async function bridgeGetController(
   if (!registry) return null;
 
   try {
+    // Wait for deferred controllers so Level 4 controllers are available
+    if (typeof registry.waitForDeferred === 'function') {
+      await registry.waitForDeferred();
+    }
     return registry.get(name) ?? null;
   } catch {
     return null;
@@ -1077,6 +1503,11 @@ export async function bridgeListControllers(
   if (!registry) return null;
 
   try {
+    // Wait for deferred (Level 2+) controllers to finish background init
+    // so the listing includes A9, D3, etc.
+    if (typeof registry.waitForDeferred === 'function') {
+      await registry.waitForDeferred();
+    }
     return registry.listControllers();
   } catch {
     return null;
@@ -1115,6 +1546,35 @@ export async function shutdownBridge(): Promise<void> {
   }
 }
 
+/**
+ * Wait for deferred (Level 2+) controllers to complete background initialization.
+ * MCP tool handlers should call this before accessing controllers like A9 or D3
+ * that initialize asynchronously after Level 1 boot.
+ */
+export async function bridgeWaitForDeferred(dbPath?: string): Promise<void> {
+  const registry = await getRegistry(dbPath);
+  if (registry && typeof registry.waitForDeferred === 'function') {
+    await registry.waitForDeferred();
+  }
+}
+
+// ===== OPT-001/OPT-002: Probe controller for callable methods =====
+/**
+ * Probe a controller object for a callable method by trying multiple property paths.
+ * ControllerRegistry may wrap controllers as module objects, class instances, or nested objects.
+ * Fixes bridge-fallback for ReasoningBank store/search operations.
+ */
+function getCallableMethod(obj: any, ...names: string[]): ((...args: any[]) => any) | null {
+  if (!obj) return null;
+  for (const name of names) {
+    if (typeof obj[name] === 'function') return obj[name].bind(obj);
+    if (obj.default && typeof obj.default[name] === 'function') return obj.default[name].bind(obj.default);
+    if (obj.instance && typeof obj.instance[name] === 'function') return obj.instance[name].bind(obj.instance);
+    if (obj.controller && typeof obj.controller[name] === 'function') return obj.controller[name].bind(obj.controller);
+  }
+  return null;
+}
+
 // ===== Phase 3: ReasoningBank pattern operations =====
 
 /**
@@ -1127,16 +1587,20 @@ export async function bridgeStorePattern(options: {
   confidence: number;
   metadata?: Record<string, unknown>;
   dbPath?: string;
-}): Promise<{ success: boolean; patternId: string; controller: string } | null> {
+}): Promise<{ success: boolean; patternId: string; controller: string; error?: string } | null> {
   const registry = await getRegistry(options.dbPath);
-  if (!registry) return null;
+  if (!registry) {
+    return { success: false, patternId: '', controller: '', error: 'PatternStore unavailable: registry not initialized' };
+  }
 
   try {
     const reasoningBank = registry.get('reasoningBank');
     const patternId = generateId('pattern');
 
-    if (reasoningBank && typeof reasoningBank.store === 'function') {
-      await reasoningBank.store({
+    // OPT-001: Probe for callable store method across binding patterns
+    const storeFn = getCallableMethod(reasoningBank, 'store', 'storePattern', 'add');
+    if (storeFn) {
+      await storeFn({
         id: patternId,
         content: options.pattern,
         type: options.type,
@@ -1157,9 +1621,28 @@ export async function bridgeStorePattern(options: {
       dbPath: options.dbPath,
     });
 
-    return result ? { success: true, patternId: result.id, controller: 'bridge-fallback' } : null;
-  } catch {
-    return null;
+    if (!result) {
+      // Diagnose why store is unavailable — database vs store engine
+      const ctx = getDb(registry);
+      if (!ctx) {
+        return { success: false, patternId: '', controller: '', error: 'PatternStore unavailable: database not initialized' };
+      }
+      return { success: false, patternId: '', controller: '', error: 'PatternStore unavailable: store operation failed' };
+    }
+
+    return { success: true, patternId: result.id, controller: 'bridge-fallback' };
+  } catch (e: unknown) {
+    // Diagnose the failure with cascading context
+    const registry2 = await getRegistry(options.dbPath);
+    if (!registry2) {
+      return { success: false, patternId: '', controller: '', error: 'PatternStore unavailable: registry lost during operation' };
+    }
+    const ctx = getDb(registry2);
+    if (!ctx) {
+      return { success: false, patternId: '', controller: '', error: 'PatternStore unavailable: database not initialized' };
+    }
+    const msg = e instanceof Error ? e.message : String(e);
+    return { success: false, patternId: '', controller: '', error: `PatternStore failed: ${msg}` };
   }
 }
 
@@ -1201,7 +1684,7 @@ export async function bridgeSearchPatterns(options: {
       query: options.query,
       namespace: 'pattern',
       limit: options.topK || 5,
-      threshold: options.minConfidence || 0.3,
+      threshold: options.minConfidence || await _getAdaptiveThreshold(),
       dbPath: options.dbPath,
     });
 
@@ -1259,15 +1742,18 @@ export async function bridgeRecordFeedback(options: {
     const reasoningBank = registry.get('reasoningBank');
     if (reasoningBank) {
       try {
-        if (typeof reasoningBank.recordOutcome === 'function') {
-          await reasoningBank.recordOutcome({
+        // OPT-001/002: Probe for callable methods across binding patterns
+        const recordOutcomeFn = getCallableMethod(reasoningBank, 'recordOutcome');
+        const recordFn = !recordOutcomeFn ? getCallableMethod(reasoningBank, 'record', 'addFeedback') : null;
+        if (recordOutcomeFn) {
+          await recordOutcomeFn({
             taskId: options.taskId, verdict: options.success ? 'success' : 'failure',
             score: options.quality, timestamp: Date.now(),
           });
           controller = controller === 'none' ? 'reasoningBank' : `${controller}+reasoningBank`;
           updated++;
-        } else if (typeof reasoningBank.record === 'function') {
-          await reasoningBank.record(options.taskId, options.quality);
+        } else if (recordFn) {
+          await recordFn(options.taskId, options.quality);
           controller = controller === 'none' ? 'reasoningBank' : `${controller}+reasoningBank`;
           updated++;
         }
@@ -1283,6 +1769,19 @@ export async function bridgeRecordFeedback(options: {
         }
         controller += '+skills';
       }
+    }
+
+    // ADR-0046: Forward to A6 SelfLearningRvfBackend (fire-and-forget)
+    const a6 = registry.get('selfLearningRvfBackend');
+    requireController(a6, 'selfLearningRvfBackend', 'bridgeRecordFeedback');
+    if (a6 && typeof (a6 as any).recordFeedback === 'function') {
+      (a6 as any).recordFeedback({
+        query: options.taskId,
+        selectedResult: options.agent || 'unknown',
+        reward: options.quality,
+      });
+      controller = controller === 'none' ? 'selfLearningRvf' : `${controller}+selfLearningRvf`;
+      updated++;
     }
 
     // Always store feedback as a memory entry for retrieval (ensures it persists)
@@ -1388,7 +1887,7 @@ export async function bridgeSessionStart(options: {
       query: options.context || 'session patterns',
       namespace: 'session',
       limit: 10,
-      threshold: 0.2,
+      threshold: await _getAdaptiveThreshold(),
       dbPath: options.dbPath,
     });
 
@@ -1540,6 +2039,7 @@ export async function bridgeHealthCheck(
   controllers: Array<{ name: string; enabled: boolean; level: number }>;
   attestationCount?: number;
   cacheStats?: { size: number; hits: number; misses: number };
+  attestationLog?: any;
 } | null> {
   const registry = await getRegistry(dbPath);
   if (!registry) return null;
@@ -1562,7 +2062,32 @@ export async function bridgeHealthCheck(
       cacheStats = { size: s.size ?? 0, hits: s.hits ?? 0, misses: s.misses ?? 0 };
     }
 
-    return { available: true, controllers, attestationCount, cacheStats };
+    // Phase 5: AttestationLog health stats (P5-C)
+    let attestationLog: any = undefined;
+    try {
+      const attestationCtrl = registry.get('attestationLog') as any;
+      if (attestationCtrl && typeof attestationCtrl.getStats === 'function') {
+        const aStats = await Promise.race([
+          attestationCtrl.getStats(),
+          new Promise<any>((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
+        ]);
+        attestationLog = aStats;
+      }
+    } catch { /* attestation stats unavailable */ }
+
+    // Phase 8: Deferred controllers health (ADR-0033)
+    const result: Record<string, any> = { available: true, controllers, attestationCount, cacheStats, attestationLog };
+    for (const name of ['graphAdapter', 'gnnService', 'rvfOptimizer'] as const) {
+      try {
+        const ctrl = registry.get(name) as any;
+        if (ctrl) {
+          const stats = typeof ctrl.getStats === 'function' ? ctrl.getStats() : { status: 'available' };
+          result[name] = stats;
+        }
+      } catch { /* stats unavailable */ }
+    }
+
+    return result as any;
   } catch {
     return null;
   }
@@ -1670,6 +2195,11 @@ export async function bridgeConsolidate(params: { minAge?: number; maxEntries?: 
 export async function bridgeBatchOperation(params: { operation: string; entries: any[] }): Promise<any> {
   const registry = await getRegistry();
   if (!registry) return null;
+    // ADR-0042: Resource check before batch
+    const resourceCheck = await bridgeCheckResources(registry);
+    if (resourceCheck) return { success: false, error: resourceCheck.error };
+    const batchRateCheck = await bridgeCheckRateLimit(registry, 'batch');
+    if (batchRateCheck) return { success: false, error: batchRateCheck.error };
   try {
     const batch = registry.get('batchOperations');
     if (!batch) return { success: false, error: 'BatchOperations not available' };
@@ -1758,6 +2288,1016 @@ export async function bridgeSemanticRoute(params: { input: string }): Promise<an
     const result = await router.route(params.input);
     return { route: result, controller: 'semanticRouter' };
   } catch (e: any) { return { route: null, error: e.message }; }
+}
+
+// ===== Phase 2: LearningBridge + SolverBandit bridge functions =====
+
+/**
+ * Bridge function for LearningBridge.learn() with 2s timeout.
+ * ADR-0033 Phase P2-B.
+ */
+export async function bridgeLearningBridgeLearn(options: {
+  input: string;
+  output: string;
+  reward: number;
+  context?: string;
+}): Promise<{ success: boolean; error?: string }> {
+  try {
+    const registry = await getRegistry();
+    const lb = registry?.get?.('learningBridge') as any;
+    if (!lb || typeof lb.learn !== 'function') {
+      return { success: false, error: 'LearningBridge not available' };
+    }
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('LearningBridge.learn timeout (2s)')), 2000)
+    );
+    await Promise.race([lb.learn(options.input, options.output, options.reward, options.context), timeoutPromise]);
+    return { success: true };
+  } catch (e: any) {
+    return { success: false, error: e?.message || String(e) };
+  }
+}
+
+/**
+ * Bridge function for SolverBandit.selectArm() with Thompson Sampling.
+ * ADR-0033 Phase P2-C.
+ */
+export async function bridgeSolverBanditSelect(
+  context: string,
+  arms: string[]
+): Promise<{ arm: string; confidence: number; controller: string }> {
+  try {
+    const registry = await getRegistry();
+    const bandit = registry?.get?.('solverBandit') as any;
+    if (!bandit || typeof bandit.selectArm !== 'function') {
+      return { arm: arms[0] || 'default', confidence: 0.5, controller: 'fallback' };
+    }
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('SolverBandit.selectArm timeout (2s)')), 2000)
+    );
+    const selected = await Promise.race([bandit.selectArm(context, arms), timeoutPromise]);
+    const stats = bandit.getArmStats?.(context, selected);
+    const alpha = stats?.alpha ?? 1;
+    const beta = stats?.beta ?? 1;
+    const confidence = alpha / (alpha + beta);
+    return { arm: selected, confidence, controller: 'solverBandit' };
+  } catch (e: any) {
+    return { arm: arms[0] || 'default', confidence: 0.5, controller: 'fallback' };
+  }
+}
+
+/**
+ * Bridge function for SolverBandit.recordReward() with state persistence.
+ * ADR-0033 Phase P2-C.
+ */
+export async function bridgeSolverBanditUpdate(
+  context: string,
+  arm: string,
+  reward: number,
+  cost?: number
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const registry = await getRegistry();
+    const bandit = registry?.get?.('solverBandit') as any;
+    if (!bandit || typeof bandit.recordReward !== 'function') {
+      return { success: false, error: 'SolverBandit not available' };
+    }
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('SolverBandit.recordReward timeout (2s)')), 2000)
+    );
+    await Promise.race([bandit.recordReward(context, arm, reward, cost), timeoutPromise]);
+    // Fire-and-forget: persist state (non-blocking)
+    try {
+      const state = bandit.serialize?.();
+      if (state) {
+        bridgeStoreEntry({
+          key: '_solver_bandit_state',
+          value: JSON.stringify(state),
+          namespace: 'default',
+        }).catch(() => {});
+      }
+    } catch { /* persist failure is non-fatal */ }
+    return { success: true };
+  } catch (e: any) {
+    return { success: false, error: e?.message || String(e) };
+  }
+}
+
+// ===== Phase 4-B: ExplainableRecall with Merkle proof chain =====
+
+/**
+ * P4-B: ExplainableRecall with Merkle proof chain.
+ * Returns search results with cryptographic provenance trail.
+ * Falls back to standard bridgeSearchEntries if ExplainableRecall controller unavailable.
+ */
+export async function bridgeExplainableRecall(options: {
+  query: string;
+  namespace?: string;
+  limit?: number;
+  includeProof?: boolean;
+}): Promise<{
+  success: boolean;
+  results?: any[];
+  proofChain?: any[];
+  error?: string;
+}> {
+  try {
+    const registry = await getRegistry();
+    const er = registry?.getController?.('explainableRecall') ?? registry?.get?.('explainableRecall');
+    if (!er || typeof er.recall !== 'function') {
+      // Fallback to standard search
+      const fallback = await bridgeSearchEntries({
+        query: options.query,
+        namespace: options.namespace,
+        limit: options.limit || 10,
+      });
+      return { success: true, results: fallback?.results || [], proofChain: [] };
+    }
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('ExplainableRecall timeout (2s)')), 2000)
+    );
+
+    const recallResult = await Promise.race([
+      er.recall(options.query, {
+        namespace: options.namespace,
+        limit: options.limit || 10,
+        explain: true,
+      }),
+      timeoutPromise,
+    ]);
+
+    // Build Merkle proof chain if requested
+    let proofChain: any[] = [];
+    if (options.includeProof && recallResult?.results) {
+      try {
+        const attestation = registry?.getController?.('attestationLog') ?? registry?.get?.('attestationLog');
+        if (attestation && typeof attestation.getProof === 'function') {
+          for (const result of recallResult.results.slice(0, 5)) {
+            const proof = await Promise.race([
+              attestation.getProof(result.id || result.key),
+              new Promise<any>((_, reject) => setTimeout(() => reject(new Error('proof timeout')), 1000))
+            ]);
+            if (proof) {
+              proofChain.push({
+                key: result.id || result.key,
+                proof: proof.hash || proof.merkleRoot,
+                path: proof.path || [],
+                verified: proof.verified ?? true,
+              });
+            }
+          }
+        }
+      } catch { /* proof generation optional */ }
+    }
+
+    return {
+      success: true,
+      results: recallResult?.results || [],
+      proofChain,
+    };
+  } catch (e: any) {
+    return { success: false, error: e?.message || String(e) };
+  }
+}
+
+// ===== Phase 5-D: GraphTransformer proof-gated re-ranking =====
+
+/**
+ * P5-D: GraphTransformer proof-gated re-ranking.
+ * Uses only the proof_gated module from GraphTransformerService.
+ * Returns original results unchanged on any failure.
+ */
+export async function bridgeGraphTransformerRerank(
+  results: any[],
+  query: string
+): Promise<any[]> {
+  if (!results || results.length === 0) return results;
+  try {
+    const registry = await getRegistry();
+    const gt = registry?.getController?.('graphTransformer') ?? registry?.get?.('graphTransformer');
+    if (!gt) return results;
+
+    // Use only proof_gated module (ADR-0033 scope reduction)
+    const reranker = gt.proofGated || gt;
+    if (typeof reranker.rerank !== 'function') return results;
+
+    const reranked = await Promise.race([
+      reranker.rerank(results, query, { module: 'proof_gated' }),
+      new Promise<any>((_, reject) => setTimeout(() => reject(new Error('GraphTransformer timeout')), 2000))
+    ]);
+
+    return Array.isArray(reranked) ? reranked : results;
+  } catch {
+    return results; // fallback to original order
+  }
+}
+
+// ===== ADR-0033: CausalRecall bridge =====
+
+/**
+ * CausalRecall — causal-aware search that re-ranks by causal uplift.
+ */
+export async function bridgeCausalRecall(options: {
+  query: string;
+  k?: number;
+  includeEvidence?: boolean;
+}): Promise<{ success: boolean; results?: any[]; warning?: string; error?: string }> {
+  try {
+    const registry = await getRegistry();
+    const cr = registry?.getController?.('causalRecall') ?? registry?.get?.('causalRecall');
+    if (!cr || typeof cr.search !== 'function') {
+      return { success: false, error: 'CausalRecall not available' };
+    }
+    // Cold-start guard: check if causal graph has enough edges
+    if (typeof cr.getStats === 'function') {
+      const stats = cr.getStats();
+      if (stats && (stats.totalCausalEdges || 0) < 5) {
+        return { success: true, results: [], warning: 'Cold start: fewer than 5 causal edges' };
+      }
+    }
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('CausalRecall timeout (2s)')), 2000)
+    );
+    const results = await Promise.race([
+      cr.search({ query: options.query, k: options.k || 10, includeEvidence: options.includeEvidence }),
+      timeoutPromise,
+    ]);
+    return { success: true, results: Array.isArray(results) ? results : [] };
+  } catch (e: any) {
+    return { success: false, error: e?.message || String(e) };
+  }
+}
+
+// ===== ADR-0033: BatchOperations optimize/prune bridge =====
+
+/**
+ * BatchOperations — bulk data management and optimization.
+ */
+export async function bridgeBatchOptimize(): Promise<{
+  success: boolean;
+  stats?: any;
+  error?: string;
+}> {
+  try {
+    const registry = await getRegistry();
+    const bo = registry?.getController?.('batchOperations') ?? registry?.get?.('batchOperations');
+    if (!bo) {
+      return { success: false, error: 'BatchOperations not available' };
+    }
+    // Run optimize if available
+    if (typeof bo.optimize === 'function') {
+      bo.optimize();
+    }
+    // Get stats
+    let stats = null;
+    if (typeof bo.getStats === 'function') {
+      stats = await Promise.race([
+        Promise.resolve(bo.getStats()),
+        new Promise<any>((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
+      ]);
+    }
+    return { success: true, stats };
+  } catch (e: any) {
+    return { success: false, error: e?.message || String(e) };
+  }
+}
+
+export async function bridgeBatchPrune(config?: {
+  maxAge?: number;
+  minReward?: number;
+}): Promise<{ success: boolean; pruned?: any; error?: string }> {
+  try {
+    const registry = await getRegistry();
+    const bo = registry?.getController?.('batchOperations') ?? registry?.get?.('batchOperations');
+    if (!bo || typeof bo.pruneData !== 'function') {
+      return { success: false, error: 'BatchOperations not available' };
+    }
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('BatchOperations prune timeout (2s)')), 2000)
+    );
+    const pruned = await Promise.race([bo.pruneData(config), timeoutPromise]);
+    return { success: true, pruned };
+  } catch (e: any) {
+    return { success: false, error: e?.message || String(e) };
+  }
+}
+
+// ===== Phase 8: Deferred controllers — graphAdapter, gnnService, rvfOptimizer (ADR-0033) =====
+
+/**
+ * GraphAdapter — graph database operations for episodes, skills, causal edges.
+ */
+export async function bridgeGraphAdapter(options: {
+  action: 'searchSkills' | 'stats';
+  query?: string;
+  k?: number;
+}): Promise<{ success: boolean; results?: any[]; error?: string }> {
+  try {
+    const registry = await getRegistry();
+    const ga = registry?.get?.('graphAdapter') as any;
+    if (!ga) {
+      return { success: false, error: 'GraphAdapter not available' };
+    }
+
+    switch (options.action) {
+      case 'searchSkills': {
+        if (typeof ga.searchSkills !== 'function') {
+          return { success: false, error: 'searchSkills not supported' };
+        }
+        const results = await Promise.race([
+          ga.searchSkills(null, options.k || 10),  // null embedding = text search fallback
+          new Promise<any>((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
+        ]);
+        return { success: true, results: Array.isArray(results) ? results : [] };
+      }
+      case 'stats': {
+        if (typeof ga.getStats === 'function') {
+          const stats = ga.getStats();
+          return { success: true, results: [stats] };
+        }
+        return { success: true, results: [{ status: 'available', type: 'GraphDatabaseAdapter' }] };
+      }
+      default:
+        return { success: false, error: `Unknown action: ${options.action}` };
+    }
+  } catch (e: any) {
+    return { success: false, error: e?.message || String(e) };
+  }
+}
+
+// ===== ADR-0042: Security & Reliability status functions =====
+
+export async function bridgeRateLimitStatus(
+  dbPath?: string,
+): Promise<{ success: boolean; stats?: any; error?: string }> {
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const limiter = registry.get('rateLimiter');
+    if (!limiter) return { success: false, error: 'RateLimiter not active' };
+    return { success: true, stats: typeof limiter.getStats === 'function' ? limiter.getStats() : {} };
+  } catch {
+    return { success: false, error: 'Failed to get rate limit status' };
+  }
+}
+
+export async function bridgeResourceUsage(
+  dbPath?: string,
+): Promise<{ success: boolean; stats?: any; error?: string }> {
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const tracker = registry.get('resourceTracker');
+    if (!tracker) return { success: false, error: 'ResourceTracker not active' };
+    return { success: true, stats: typeof tracker.getStats === 'function' ? tracker.getStats() : {} };
+  } catch {
+    return { success: false, error: 'Failed to get resource usage' };
+  }
+}
+
+export async function bridgeCircuitStatus(
+  dbPath?: string,
+): Promise<{ success: boolean; stats?: any; error?: string }> {
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const breaker = registry.get('circuitBreakerController');
+    if (!breaker) return { success: false, error: 'CircuitBreaker not active' };
+    return { success: true, stats: typeof breaker.getStats === 'function' ? breaker.getStats() : {} };
+  } catch {
+    return { success: false, error: 'Failed to get circuit breaker status' };
+  }
+}
+
+// ===== ADR-0047: Quantization, health & federated learning bridges =====
+
+export async function bridgeSelectBackend(
+  dbPath?: string,
+  entryCount?: number,
+): Promise<{ success: boolean; backend?: string; quantized?: boolean; error?: string }> {
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    if (entryCount !== undefined && entryCount > QUANTIZATION_THRESHOLD) {
+      const quantized = registry.get('quantizedVectorStore');
+      const quantizedChecked = requireController(quantized, 'quantizedVectorStore', 'bridgeSelectBackend');
+      if (quantizedChecked) {
+        return { success: true, backend: 'quantizedVectorStore', quantized: true };
+      }
+    }
+    return { success: true, backend: 'vectorBackend', quantized: false };
+  } catch {
+    return { success: false, error: 'Failed to select backend' };
+  }
+}
+
+export async function bridgeQuantizeStatus(
+  dbPath?: string,
+): Promise<{ success: boolean; stats?: any; error?: string }> {
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const quantized = registry.get('quantizedVectorStore');
+    if (!quantized) return { success: false, error: 'QuantizedVectorStore not active' };
+    return { success: true, stats: typeof quantized.getStats === 'function' ? quantized.getStats() : {} };
+  } catch {
+    return { success: false, error: 'Failed to get quantization status' };
+  }
+}
+
+export async function bridgeHealthReport(
+  dbPath?: string,
+): Promise<{ success: boolean; assessment?: any; error?: string }> {
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    // Wait for deferred (Level 2+) controllers so Level 4 IndexHealthMonitor is ready
+    if (typeof registry.waitForDeferred === 'function') {
+      await registry.waitForDeferred();
+    }
+    const monitor = registry.get('indexHealthMonitor');
+    const monitorChecked = requireController(monitor, 'indexHealthMonitor', 'bridgeHealthReport');
+    if (!monitorChecked) return { success: false, error: 'IndexHealthMonitor not active' };
+    if (typeof monitorChecked.assess !== 'function') {
+      return { success: true, assessment: {} };
+    }
+    // assess() requires IndexStats; provide safe defaults when no HNSW index is available
+    const defaultStats = { indexedVectors: 0, layers: 0, m: 16, efConstruction: 200, needsRebuild: false };
+    return { success: true, assessment: monitorChecked.assess(defaultStats) };
+  } catch (e: any) {
+    const msg = e?.controllerName ? `${e.controllerName} not available` : (e?.message || 'Failed to get health report');
+    return { success: false, error: msg };
+  }
+}
+
+export async function bridgeFederatedRound(
+  dbPath?: string,
+  action?: string,
+  params?: any,
+): Promise<{ success: boolean; result?: any; error?: string }> {
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const manager = registry.get('federatedLearningManager');
+    const managerChecked = requireController(manager, 'federatedLearningManager', 'bridgeFederatedRound');
+    if (!managerChecked) return { success: false, error: 'FederatedLearningManager not active' };
+    const op = action || 'status';
+    switch (op) {
+      case 'start':
+        return { success: true, result: typeof managerChecked.startRound === 'function' ? managerChecked.startRound() : {} };
+      case 'submit':
+        return { success: true, result: typeof managerChecked.submitUpdate === 'function' ? managerChecked.submitUpdate(params) : {} };
+      case 'aggregate':
+        return { success: true, result: typeof managerChecked.aggregateRound === 'function' ? managerChecked.aggregateRound() : {} };
+      case 'status':
+        return { success: true, result: typeof managerChecked.getStatus === 'function' ? managerChecked.getStatus() : {} };
+      default:
+        return { success: false, error: `Unknown federated action: ${op}` };
+    }
+  } catch {
+    return { success: false, error: 'Failed to execute federated round action' };
+  }
+}
+
+// ===== ADR-0043: Query & Filtering Infrastructure =====
+
+/**
+ * Search entries, then apply MetadataFilter (B5) for structured metadata predicates.
+ * Falls back to unfiltered results if controller unavailable.
+ */
+export async function bridgeFilteredSearch(options: {
+  query: string;
+  filter?: Record<string, unknown>;
+  namespace?: string;
+  limit?: number;
+  threshold?: number;
+  dbPath?: string;
+}): Promise<{ success: boolean; results: any[]; filtered: boolean; searchTime: number; error?: string } | null> {
+  const searchResult = await bridgeSearchEntries({
+    query: options.query,
+    namespace: options.namespace,
+    limit: options.limit,
+    threshold: options.threshold,
+    dbPath: options.dbPath,
+  });
+  if (!searchResult) {
+    // Diagnose why search is unavailable — registry vs database vs search engine
+    const registry = await getRegistry(options.dbPath);
+    if (!registry) {
+      return { success: false, results: [], filtered: false, searchTime: 0, error: 'FilteredSearch unavailable: registry not initialized' };
+    }
+    const ctx = getDb(registry);
+    if (!ctx) {
+      return { success: false, results: [], filtered: false, searchTime: 0, error: 'FilteredSearch unavailable: database not initialized' };
+    }
+    return { success: false, results: [], filtered: false, searchTime: 0, error: 'FilteredSearch unavailable: search engine returned no results' };
+  }
+  if (!options.filter || Object.keys(options.filter).length === 0) {
+    return { ...searchResult, filtered: false };
+  }
+
+  const registry = await getRegistry(options.dbPath);
+  if (!registry) return { ...searchResult, filtered: false };
+
+  try {
+    const mf = registry.get('metadataFilter');
+    const mfChecked = requireController(mf, 'metadataFilter', 'bridgeFilteredSearch');
+    if (!mfChecked || typeof mfChecked.filter !== 'function') {
+      return { ...searchResult, filtered: false };
+    }
+    const filtered = mfChecked.filter(searchResult.results, options.filter);
+    return {
+      success: true,
+      results: Array.isArray(filtered) ? filtered : searchResult.results,
+      filtered: true,
+      searchTime: searchResult.searchTime,
+    };
+  } catch {
+    return { ...searchResult, filtered: false };
+  }
+}
+
+/**
+ * Wraps bridgeSearchEntries with QueryOptimizer (B6) LRU cache.
+ * Falls back to standard search if controller unavailable.
+ */
+export async function bridgeOptimizedSearch(options: {
+  query: string;
+  namespace?: string;
+  limit?: number;
+  threshold?: number;
+  dbPath?: string;
+}): Promise<{ success: boolean; results: any[]; cached: boolean; searchTime: number; error?: string } | null> {
+  const registry = await getRegistry(options.dbPath);
+  if (!registry) return null;
+
+  try {
+    const qo = registry.get('queryOptimizer');
+    const qoChecked = requireController(qo, 'queryOptimizer', 'bridgeOptimizedSearch');
+    if (!qoChecked || typeof qoChecked.getCached !== 'function') {
+      const result = await bridgeSearchEntries(options);
+      return result ? { ...result, cached: false } : null;
+    }
+
+    const cacheKey = JSON.stringify({ q: options.query, ns: options.namespace, limit: options.limit, th: options.threshold });
+    const cached = qoChecked.getCached(cacheKey);
+    if (cached) {
+      return { success: true, results: cached.results || cached, cached: true, searchTime: 0 };
+    }
+
+    const result = await bridgeSearchEntries(options);
+    if (result && result.success) {
+      try { qoChecked.cache(cacheKey, result); } catch { /* cache write failure is non-fatal */ }
+    }
+    return result ? { ...result, cached: false } : null;
+  } catch {
+    const result = await bridgeSearchEntries(options);
+    return result ? { ...result, cached: false } : null;
+  }
+}
+
+/**
+ * Returns QueryOptimizer cache statistics.
+ */
+export async function bridgeQueryStats(
+  dbPath?: string,
+): Promise<{ success: boolean; stats?: { cacheHits: number; cacheMisses: number; cacheSize: number }; error?: string }> {
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const qo = registry.get('queryOptimizer');
+    if (!qo) return { success: false, error: 'QueryOptimizer not active' };
+    // Use getCacheStats() for cache hit/miss/size (getStats() returns per-query array)
+    const stats = typeof qo.getCacheStats === 'function'
+      ? qo.getCacheStats()
+      : typeof qo.getStats === 'function'
+        ? qo.getStats()
+        : { cacheHits: 0, cacheMisses: 0, cacheSize: 0 };
+    return { success: true, stats };
+  } catch {
+    return { success: false, error: 'Failed to get query stats' };
+  }
+}
+
+// ===== ADR-0045: Embeddings, Compliance & Observability bridge functions =====
+
+/**
+ * Bridge embed text via A9 EnhancedEmbeddingService with fallback chain.
+ * Falls back to existing embedding pipeline if A9 is not available.
+ */
+export async function bridgeEmbed(
+  text: string,
+  dbPath?: string,
+): Promise<{ success: boolean; embedding?: number[]; dimension?: number; provider?: string; cached?: boolean; error?: string }> {
+  if (!text || typeof text !== 'string') {
+    return { success: false, error: 'text is required (non-empty string)' };
+  }
+  const registry = await getRegistry(dbPath);
+  if (!registry) {
+    // Fallback: use existing embedding pipeline when registry unavailable
+    try {
+      const { generateEmbedding } = await import('./memory-initializer.js');
+      const result = await generateEmbedding(text);
+      return { success: true, embedding: Array.from(result.embedding), dimension: result.dimensions, provider: result.model };
+    } catch (err) {
+      return { success: false, error: 'No embedding service available' };
+    }
+  }
+  try {
+    // Wait for deferred (Level 2+) controllers so A9 EnhancedEmbeddingService is ready
+    if (typeof registry.waitForDeferred === 'function') {
+      await registry.waitForDeferred();
+    }
+    const enhanced = registry.get('enhancedEmbeddingService');
+    requireController(enhanced, 'enhancedEmbeddingService', 'bridgeEmbed');
+    if (enhanced && typeof enhanced.embed === 'function') {
+      const result = await enhanced.embed(text);
+      // N6: EnhancedEmbeddingService.embed() returns Float32Array, not an object.
+      // Previous code destructured result.embedding/result.provider which are
+      // undefined on Float32Array, producing { embedding: [], dimension: 0,
+      // provider: "unknown" } — a false success with zero-dimension embedding.
+      if (result instanceof Float32Array || ArrayBuffer.isView(result)) {
+        // Direct Float32Array return from services/enhanced-embeddings.ts
+        const embedding = Array.from(result as Float32Array);
+        if (embedding.length === 0) {
+          return { success: false, error: 'EnhancedEmbeddingService returned empty embedding' };
+        }
+        // Extract provider/model info from getStats() if available
+        let provider = 'transformers';
+        if (typeof enhanced.getStats === 'function') {
+          const stats = enhanced.getStats();
+          provider = stats?.model?.provider ?? 'transformers';
+        }
+        return { success: true, embedding, dimension: embedding.length, provider, cached: false };
+      }
+      if (result && typeof result === 'object') {
+        // Object-shaped return (future-proofing if API changes)
+        const embeddingData = (result as any).embedding;
+        const arr = Array.isArray(embeddingData) ? embeddingData
+          : (embeddingData instanceof Float32Array || ArrayBuffer.isView(embeddingData))
+            ? Array.from(embeddingData as Float32Array)
+            : [];
+        if (arr.length === 0) {
+          return { success: false, error: 'EnhancedEmbeddingService returned empty embedding' };
+        }
+        return {
+          success: true,
+          embedding: arr,
+          dimension: (result as any).dimension ?? arr.length,
+          provider: (result as any).provider ?? 'unknown',
+          cached: (result as any).cached ?? false,
+        };
+      }
+      return { success: false, error: 'EnhancedEmbeddingService returned unexpected result type' };
+    }
+    // A9 not available — fallback to existing pipeline
+    try {
+      const { generateEmbedding } = await import('./memory-initializer.js');
+      const result = await generateEmbedding(text);
+      return { success: true, embedding: Array.from(result.embedding), dimension: result.dimensions, provider: result.model };
+    } catch {
+      return { success: false, error: 'EnhancedEmbeddingService not active and fallback failed' };
+    }
+  } catch (err) {
+    return { success: false, error: 'Embedding failed: ' + (err instanceof Error ? err.message : 'unknown') };
+  }
+}
+
+/**
+ * Bridge audit event via D3 AuditLogger.
+ * No-op when D3 is absent (graceful degradation per ADR-0045).
+ */
+export async function bridgeAuditEvent(
+  type: string,
+  payload: Record<string, unknown>,
+  dbPath?: string,
+): Promise<{ success: boolean; logged?: boolean; error?: string }> {
+  if (!type || typeof type !== 'string') {
+    return { success: false, error: 'type is required (non-empty string)' };
+  }
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: true, logged: false }; // no-op when absent
+  try {
+    const logger = registry.get('auditLogger');
+    const loggerChecked = requireController(logger, 'auditLogger', 'bridgeAuditEvent');
+    if (!loggerChecked) return { success: true, logged: false }; // no-op when absent
+    if (typeof loggerChecked.log === 'function') {
+      await loggerChecked.log({ type, payload: payload ?? {}, timestamp: Date.now() });
+      return { success: true, logged: true };
+    }
+    if (typeof loggerChecked.record === 'function') {
+      await loggerChecked.record({ type, payload: payload ?? {}, timestamp: Date.now() });
+      return { success: true, logged: true };
+    }
+    return { success: true, logged: false };
+  } catch (err) {
+    return { success: false, error: 'Audit logging failed: ' + (err instanceof Error ? err.message : 'unknown') };
+  }
+}
+
+/**
+ * Bridge telemetry metrics via D1 TelemetryManager.
+ */
+export async function bridgeTelemetryMetrics(
+  dbPath?: string,
+): Promise<{ success: boolean; metrics?: any; error?: string }> {
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const telemetry = registry.get('telemetryManager');
+    if (!telemetry) return { success: false, error: 'TelemetryManager not active' };
+    return { success: true, metrics: typeof telemetry.getMetrics === 'function' ? telemetry.getMetrics() : {} };
+  } catch {
+    return { success: false, error: 'Failed to get telemetry metrics' };
+  }
+}
+
+/**
+ * Bridge telemetry spans via D1 TelemetryManager.
+ */
+export async function bridgeTelemetrySpans(
+  limit?: number,
+  dbPath?: string,
+): Promise<{ success: boolean; spans?: any[]; error?: string }> {
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const telemetry = registry.get('telemetryManager');
+    if (!telemetry) return { success: false, error: 'TelemetryManager not active' };
+    return { success: true, spans: typeof telemetry.getSpans === 'function' ? telemetry.getSpans(limit ?? 100) : [] };
+  } catch {
+    return { success: false, error: 'Failed to get telemetry spans' };
+  }
+}
+
+// ===== ADR-0046: Self-Learning Pipeline & Native Acceleration =====
+
+/**
+ * Search via A6 SelfLearningRvfBackend with router + SONA enhancement.
+ * Falls back to standard bridgeSearchEntries when A6 unavailable.
+ */
+export async function bridgeSelfLearningSearch(options: {
+  query: string;
+  limit?: number;
+  namespace?: string;
+  threshold?: number;
+  dbPath?: string;
+}): Promise<{ success: boolean; results: any[]; routed: boolean; controller: string; stats?: any } | null> {
+  const registry = await getRegistry(options.dbPath);
+  if (!registry) return null;
+
+  try {
+    // Try A6 SelfLearningRvfBackend first
+    const a6 = registry.get('selfLearningRvfBackend');
+    requireController(a6, 'selfLearningRvfBackend', 'bridgeSelfLearningSearch');
+    if (a6 && typeof (a6 as any).search === 'function') {
+      const results = await (a6 as any).search({
+        query: options.query,
+        limit: options.limit || 10,
+        namespace: options.namespace,
+        threshold: options.threshold,
+      });
+      const stats = typeof (a6 as any).getStats === 'function'
+        ? (a6 as any).getStats()
+        : undefined;
+      return { success: true, results: results || [], routed: true, controller: 'selfLearningRvfBackend', stats };
+    }
+
+    // Fallback to standard search
+    const fallback = await bridgeSearchEntries({
+      query: options.query,
+      limit: options.limit || 10,
+      namespace: options.namespace,
+      threshold: options.threshold,
+      dbPath: options.dbPath,
+    });
+    return {
+      success: !!fallback?.results,
+      results: fallback?.results || [],
+      routed: false,
+      controller: 'bridgeSearchEntries',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Record feedback through A6 SelfLearningRvfBackend (fire-and-forget).
+ * A6 uses feedback for Thompson Sampling policy updates and SONA trajectory recording.
+ */
+export async function bridgeSelfLearningFeedback(options: {
+  query: string;
+  selectedResult: string;
+  reward: number;
+  dbPath?: string;
+}): Promise<{ success: boolean; controller: string } | null> {
+  const registry = await getRegistry(options.dbPath);
+  if (!registry) return null;
+
+  try {
+    const a6 = registry.get('selfLearningRvfBackend');
+    const a6Checked = requireController(a6, 'selfLearningRvfBackend', 'bridgeSelfLearningFeedback');
+    if (!a6Checked || typeof (a6Checked as any).recordFeedback !== 'function') {
+      return { success: false, controller: 'none' };
+    }
+
+    // Fire-and-forget: do not await — must not block response
+    (a6Checked as any).recordFeedback({
+      query: options.query,
+      selectedResult: options.selectedResult,
+      reward: options.reward,
+    });
+
+    return { success: true, controller: 'selfLearningRvfBackend' };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get A6 SelfLearningRvfBackend stats (sub-component health).
+ */
+export async function bridgeSelfLearningStats(
+  dbPath?: string,
+): Promise<{ success: boolean; stats?: any; error?: string }> {
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const a6 = registry.get('selfLearningRvfBackend');
+    if (!a6) return { success: false, error: 'SelfLearningRvfBackend not active' };
+    const stats = typeof (a6 as any).getStats === 'function' ? (a6 as any).getStats() : {};
+    return { success: true, stats };
+  } catch {
+    return { success: false, error: 'Failed to get self-learning stats' };
+  }
+}
+
+/**
+ * Get B4 NativeAccelerator capability report.
+ */
+export async function bridgeNativeAcceleratorStats(
+  dbPath?: string,
+): Promise<{ success: boolean; stats?: any; error?: string }> {
+  const registry = await getRegistry(dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const b4 = registry.get('nativeAccelerator');
+    if (!b4) return { success: false, error: 'NativeAccelerator not active' };
+    const stats = typeof (b4 as any).getStats === 'function' ? (b4 as any).getStats() : {};
+    return { success: true, stats };
+  } catch {
+    return { success: false, error: 'Failed to get native accelerator stats' };
+  }
+}
+
+// ===== ADR-0044: Attention Suite Bridge Functions =====
+
+export async function bridgeAttentionSearch(options: {
+  query: string;
+  namespace?: string;
+  limit?: number;
+  dbPath?: string;
+}): Promise<{ success: boolean; results?: any[]; attention?: boolean; error?: string }> {
+  const registry = await getRegistry(options.dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const multiHead = registry.get('multiHeadAttention');
+    const multiHeadChecked = requireController(multiHead, 'multiHeadAttention', 'bridgeAttentionSearch');
+    if (!multiHeadChecked) {
+      // Fallback to standard search when attention controller unavailable
+      const fallback = await bridgeSearchEntries({
+        query: options.query,
+        namespace: options.namespace || 'default',
+        limit: options.limit || 10,
+      });
+      return fallback ?? { success: false, error: 'Search returned null' };
+    }
+    // Get vector results first, then re-rank with attention
+    const vectorResults = await bridgeSearchEntries({
+      query: options.query,
+      namespace: options.namespace || 'default',
+      limit: Math.min((options.limit || 10) * 3, 100), // Over-fetch for re-ranking
+    });
+    if (!vectorResults || !vectorResults.success || !vectorResults.results?.length) {
+      return vectorResults ?? { success: false, error: 'Search returned null' };
+    }
+    // Re-rank using multi-head attention
+    const attended = typeof multiHeadChecked.computeMultiHeadAttention === 'function'
+      ? await multiHeadChecked.computeMultiHeadAttention(
+          vectorResults.results.map((r: any) => r.embedding || []).filter((e: any) => e.length > 0),
+          { topK: options.limit || 10 }
+        )
+      : null;
+    if (!attended) return { ...vectorResults, attention: false };
+    // Apply attention scores to reorder results
+    const reranked = vectorResults.results
+      .map((r: any, i: number) => ({
+        ...r,
+        attentionScore: attended.aggregatedScores?.[i]?.score ?? r.score ?? 0,
+      }))
+      .sort((a: any, b: any) => (b.attentionScore ?? 0) - (a.attentionScore ?? 0))
+      .slice(0, options.limit || 10);
+    return { success: true, results: reranked, attention: true };
+  } catch {
+    return { success: false, error: 'Attention search failed' };
+  }
+}
+
+export async function bridgeFlashConsolidate(params: {
+  entries?: any[];
+  blockSize?: number;
+  dbPath?: string;
+}): Promise<{ success: boolean; result?: any; error?: string }> {
+  const registry = await getRegistry(params.dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const attn = registry.get('attentionService');
+    const attnChecked = requireController(attn, 'attentionService', 'bridgeFlashConsolidate');
+    if (!attnChecked || typeof attnChecked.applyFlashAttention !== 'function') {
+      // Fallback to standard consolidation
+      return bridgeConsolidate({ maxEntries: params.entries?.length });
+    }
+    const entries = params.entries || [];
+    if (entries.length === 0) return { success: true, result: { consolidated: 0 } };
+    const embeddings = entries.map((e: any) => e.embedding || []).filter((e: any[]) => e.length > 0);
+    if (embeddings.length < 2) return { success: true, result: { consolidated: embeddings.length } };
+    const query = embeddings[0];
+    const keys = embeddings.slice(1);
+    const values = keys; // Self-attention: keys === values
+    const output = await attnChecked.applyFlashAttention(query, keys, values);
+    return { success: true, result: { consolidated: entries.length, flashOutput: output } };
+  } catch {
+    return { success: false, error: 'Flash consolidation failed' };
+  }
+}
+
+export async function bridgeMoERoute(params: {
+  task: string;
+  candidates?: string[];
+  topK?: number;
+  dbPath?: string;
+}): Promise<{ success: boolean; result?: any; error?: string }> {
+  const registry = await getRegistry(params.dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const attn = registry.get('attentionService');
+    const attnChecked = requireController(attn, 'attentionService', 'bridgeMoERoute');
+    if (!attnChecked || typeof attnChecked.applyMoE !== 'function') {
+      return { success: false, error: 'AttentionService (MoE) not available' };
+    }
+    // Generate a simple hash-based input vector from the task string
+    const dim = 64;
+    const input = new Array(dim).fill(0);
+    for (let i = 0; i < params.task.length && i < 1000; i++) {
+      input[i % dim] += params.task.charCodeAt(i) / 128;
+    }
+    const experts = params.candidates?.length || 8;
+    const topK = Math.min(params.topK || 2, experts);
+    const moeResult = await attnChecked.applyMoE(input, experts, topK);
+    return {
+      success: true,
+      result: {
+        expertWeights: moeResult.expertWeights,
+        selectedExperts: moeResult.expertWeights
+          .map((w: number, i: number) => ({ index: i, weight: w, candidate: params.candidates?.[i] }))
+          .filter((e: any) => e.weight > 0)
+          .sort((a: any, b: any) => b.weight - a.weight),
+      },
+    };
+  } catch {
+    return { success: false, error: 'MoE routing failed' };
+  }
+}
+
+export async function bridgeGraphRoPESearch(params: {
+  query: string;
+  hopDistances?: number[];
+  maxHops?: number;
+  dbPath?: string;
+}): Promise<{ success: boolean; result?: any; error?: string }> {
+  const registry = await getRegistry(params.dbPath);
+  if (!registry) return { success: false, error: 'Registry not available' };
+  try {
+    const attn = registry.get('attentionService');
+    const attnChecked = requireController(attn, 'attentionService', 'bridgeGraphRoPESearch');
+    if (!attnChecked) {
+      return { success: false, error: 'AttentionService (GraphRoPE) not available' };
+    }
+    // GraphRoPE requires the attention service's low-level API
+    // For now, delegate to the service if it exposes graphRoPE
+    if (typeof (attnChecked as any).graphRoPE === 'function') {
+      const result = await (attnChecked as any).graphRoPE(params.query, {
+        hopDistances: params.hopDistances || [],
+        maxHops: params.maxHops || 10,
+      });
+      return { success: true, result };
+    }
+    return { success: false, error: 'GraphRoPE not available on AttentionService' };
+  } catch {
+    return { success: false, error: 'GraphRoPE search failed' };
+  }
 }
 
 // ===== Utility =====
