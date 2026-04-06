@@ -6,6 +6,7 @@
 import { mkdirSync, writeFileSync, existsSync, readFileSync, statSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import type { MCPTool } from './types.js';
+import { getBaseCwd } from './cwd-helper.js';
 
 // Real vector search functions - lazy loaded to avoid circular imports
 let searchEntriesFn: ((options: {
@@ -1570,7 +1571,7 @@ export const hooksSessionStart: MCPTool = {
       try {
         // Dynamic import to avoid circular dependencies
         const { startDaemon } = await import('../services/worker-daemon.js');
-        const daemon = await startDaemon(process.cwd());
+        const daemon = await startDaemon(getBaseCwd());
         const status = daemon.getStatus();
         daemonStatus = {
           started: true,

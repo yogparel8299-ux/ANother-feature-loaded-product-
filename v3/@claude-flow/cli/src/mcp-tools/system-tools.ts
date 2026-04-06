@@ -14,6 +14,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as os from 'node:os';
+import { getBaseCwd } from './cwd-helper.js';
 
 // Read version dynamically from package.json
 function getPackageVersion(): string {
@@ -47,7 +48,7 @@ interface SystemMetrics {
 }
 
 function getSystemDir(): string {
-  return join(process.cwd(), STORAGE_DIR, SYSTEM_DIR);
+  return join(getBaseCwd(), STORAGE_DIR, SYSTEM_DIR);
 }
 
 function getMetricsPath(): string {
@@ -308,7 +309,7 @@ export const systemTools: MCPTool[] = [
         platform: process.platform,
         arch: process.arch,
         pid: process.pid,
-        cwd: process.cwd(),
+        cwd: getBaseCwd(),
         env: process.env.NODE_ENV || 'development',
         features: {
           swarm: true,
@@ -437,7 +438,7 @@ export const systemTools: MCPTool[] = [
     },
     handler: async () => {
       // Read from the task store file
-      const storePath = join(process.cwd(), '.claude-flow', 'tasks', 'store.json');
+      const storePath = join(getBaseCwd(), '.claude-flow', 'tasks', 'store.json');
       let tasks: Array<{ status: string }> = [];
       try {
         if (existsSync(storePath)) {

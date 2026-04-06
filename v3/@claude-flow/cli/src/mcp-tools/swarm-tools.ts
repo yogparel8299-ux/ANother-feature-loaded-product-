@@ -8,6 +8,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { MCPTool } from './types.js';
+import { getBaseCwd } from './cwd-helper.js';
 
 // Swarm state persistence
 const SWARM_DIR = '.claude-flow/swarm';
@@ -31,7 +32,7 @@ interface SwarmStore {
 }
 
 function getSwarmDir(): string {
-  return join(process.cwd(), SWARM_DIR);
+  return join(getBaseCwd(), SWARM_DIR);
 }
 
 function getSwarmStatePath(): string {

@@ -11,6 +11,7 @@ import type { MCPTool } from './types.js';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { getBaseCwd } from './cwd-helper.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -22,8 +23,8 @@ const CLI_ROOT = join(__dirname, '../../..');
  */
 function findProjectRoot(): string {
   // Strategy 1: CWD (most reliable when invoked by user)
-  if (existsSync(join(process.cwd(), '.claude'))) {
-    return process.cwd();
+  if (existsSync(join(getBaseCwd(), '.claude'))) {
+    return getBaseCwd();
   }
 
   // Strategy 2: Walk up from CLI package location
@@ -34,7 +35,7 @@ function findProjectRoot(): string {
   }
 
   // Strategy 3: Walk up from CWD
-  let dir = process.cwd();
+  let dir = getBaseCwd();
   for (let i = 0; i < 10; i++) {
     if (existsSync(join(dir, '.claude'))) return dir;
     const parent = dirname(dir);
@@ -43,7 +44,7 @@ function findProjectRoot(): string {
   }
 
   // Fallback: CWD
-  return process.cwd();
+  return getBaseCwd();
 }
 
 const PROJECT_ROOT = findProjectRoot();
