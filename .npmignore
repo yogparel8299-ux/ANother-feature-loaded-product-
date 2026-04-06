@@ -1,48 +1,55 @@
+# Source maps - not needed for production (saves 464 files, ~33% size reduction)
+**/*.map
+**/*.js.map
+**/*.d.ts.map
+
 # Development files
-*.test.ts
-*.spec.ts
-test/
-tests/
-coverage/
-.github/
-.vscode/
+**/__tests__/**
+**/*.test.ts
+**/*.spec.ts
+**/vitest.config.*
+**/.eslintrc.*
+**/tsconfig.json
+**/jest.config.*
 
 # Build artifacts
-bin/claude-flow-simple
-bin/claude-flow-typecheck
-*.tgz
+**/node_modules/**
+**/.turbo/**
+**/.cache/**
 
-# Documentation
-docs/
-examples/
-plans/
-research/
-coordination/
-memory/
-mcp_config/
+# Database files (user-specific)
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/hnsw.index
+**/hnsw.metadata.json
 
-# Scripts (except install.js)
-scripts/*.ts
-scripts/*.sh
-scripts/demo-*.ts
-scripts/test-*.ts
-scripts/validate-*.ts
-scripts/check-*.ts
-scripts/coverage-*.ts
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# Logs and temp files
-*.log
-*.tmp
+# OS files
 .DS_Store
-node_modules/
-dist/
-test-results/
+Thumbs.db
 
-# Config files
-tsconfig.json
-vitest.config.ts
-codecov.yml
-claude.md
+# V2 legacy (not needed in npm package)
+v2/
+
+# Development docs
+docs/
 *.md
 !README.md
 !LICENSE
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Temporary
+tmp/
+temp/
+*.tmp
+*.log
