@@ -291,7 +291,7 @@ show_quickstart() {
         echo -e "  ${BOLD}ruflo doctor${NC}"
         echo ""
         echo -e "  ${DIM}# Add as MCP server to Claude Code${NC}"
-        echo -e "  ${BOLD}claude mcp add ruflo -- ruflo mcp start${NC}"
+        echo -e "  ${BOLD}claude mcp add ruflo -e CLAUDE_FLOW_CWD=\"\$HOME\" -- ruflo mcp start${NC}"
     else
         echo -e "  ${DIM}# Initialize project${NC}"
         echo -e "  ${BOLD}npx ruflo@latest init --wizard${NC}"
@@ -329,9 +329,9 @@ setup_mcp_server() {
 
     # Add MCP server
     if [ "$GLOBAL" = "1" ]; then
-        claude mcp add ruflo -- ruflo mcp start 2>/dev/null && \
+        claude mcp add ruflo -e CLAUDE_FLOW_CWD="$HOME" -- ruflo mcp start 2>/dev/null && \
             print_substep "MCP server configured ✓" || \
-            print_warning "MCP setup failed - run manually: claude mcp add ruflo -- ruflo mcp start"
+            print_warning "MCP setup failed - run manually: claude mcp add ruflo -e CLAUDE_FLOW_CWD=\"\$HOME\" -- ruflo mcp start"
     else
         claude mcp add ruflo -- npx -y ruflo@${VERSION} mcp start 2>/dev/null && \
             print_substep "MCP server configured ✓" || \
