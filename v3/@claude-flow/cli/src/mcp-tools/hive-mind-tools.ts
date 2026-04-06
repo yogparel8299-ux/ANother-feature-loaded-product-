@@ -7,6 +7,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { MCPTool } from './types.js';
+import { getBaseCwd } from './cwd-helper.js';
 
 // Storage paths
 const STORAGE_DIR = '.claude-flow';
@@ -151,7 +152,7 @@ function tryResolveProposal(
 }
 
 function getHiveDir(): string {
-  return join(process.cwd(), STORAGE_DIR, HIVE_DIR);
+  return join(getBaseCwd(), STORAGE_DIR, HIVE_DIR);
 }
 
 function getHivePath(): string {
@@ -196,7 +197,7 @@ function saveHiveState(state: HiveState): void {
 import { existsSync as agentStoreExists, readFileSync as readAgentStore, writeFileSync as writeAgentStore, mkdirSync as mkdirAgentStore } from 'node:fs';
 
 function loadAgentStore(): { agents: Record<string, unknown> } {
-  const storePath = join(process.cwd(), '.claude-flow', 'agents.json');
+  const storePath = join(getBaseCwd(), '.claude-flow', 'agents.json');
   try {
     if (agentStoreExists(storePath)) {
       return JSON.parse(readAgentStore(storePath, 'utf-8'));
@@ -206,7 +207,7 @@ function loadAgentStore(): { agents: Record<string, unknown> } {
 }
 
 function saveAgentStore(store: { agents: Record<string, unknown> }): void {
-  const storeDir = join(process.cwd(), '.claude-flow');
+  const storeDir = join(getBaseCwd(), '.claude-flow');
   if (!agentStoreExists(storeDir)) {
     mkdirAgentStore(storeDir, { recursive: true });
   }
@@ -346,7 +347,7 @@ export const hiveMindTools: MCPTool[] = [
       const agentStore = loadAgentStore();
 
       // Compute real task metrics from task store
-      const taskStorePath = join(process.cwd(), '.claude-flow', 'tasks', 'store.json');
+      const taskStorePath = join(getBaseCwd(), '.claude-flow', 'tasks', 'store.json');
       let pendingTaskCount = 0;
       let activeTaskCount = 0;
       let completedTaskCount = 0;

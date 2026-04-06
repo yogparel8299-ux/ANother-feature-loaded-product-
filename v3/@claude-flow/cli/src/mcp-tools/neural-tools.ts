@@ -15,6 +15,7 @@
 import type { MCPTool } from './types.js';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { getBaseCwd } from './cwd-helper.js';
 
 // Try to import real embeddings — prefer agentic-flow v3 ReasoningBank, then @claude-flow/embeddings
 let realEmbeddings: { embed: (text: string) => Promise<number[]> } | null = null;
@@ -90,7 +91,7 @@ interface NeuralStore {
 }
 
 function getNeuralDir(): string {
-  return join(process.cwd(), STORAGE_DIR, NEURAL_DIR);
+  return join(getBaseCwd(), STORAGE_DIR, NEURAL_DIR);
 }
 
 function getNeuralPath(): string {

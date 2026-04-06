@@ -7,6 +7,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { MCPTool } from './types.js';
+import { getBaseCwd } from './cwd-helper.js';
 
 // Storage paths
 const STORAGE_DIR = '.claude-flow';
@@ -34,7 +35,7 @@ interface TaskStore {
 }
 
 function getTaskDir(): string {
-  return join(process.cwd(), STORAGE_DIR, TASK_DIR);
+  return join(getBaseCwd(), STORAGE_DIR, TASK_DIR);
 }
 
 function getTaskPath(): string {
@@ -243,7 +244,7 @@ export const taskTools: MCPTool[] = [
 
         // Sync assigned agents back to idle and increment taskCount
         if (task.assignedTo.length > 0) {
-          const agentStorePath = join(process.cwd(), STORAGE_DIR, 'agents.json');
+          const agentStorePath = join(getBaseCwd(), STORAGE_DIR, 'agents.json');
           try {
             let agentStore: { agents: Record<string, Record<string, unknown>> } = { agents: {} };
             if (existsSync(agentStorePath)) {
@@ -354,7 +355,7 @@ export const taskTools: MCPTool[] = [
       const previouslyAssigned = [...task.assignedTo];
 
       // Load agent store to sync worker state
-      const agentStorePath = join(process.cwd(), STORAGE_DIR, 'agents.json');
+      const agentStorePath = join(getBaseCwd(), STORAGE_DIR, 'agents.json');
       let agentStore: { agents: Record<string, Record<string, unknown>> } = { agents: {} };
       try {
         if (existsSync(agentStorePath)) {
@@ -399,7 +400,7 @@ export const taskTools: MCPTool[] = [
 
       saveTaskStore(store);
       // Save agent store
-      const agentDir = join(process.cwd(), STORAGE_DIR);
+      const agentDir = join(getBaseCwd(), STORAGE_DIR);
       if (!existsSync(agentDir)) {
         mkdirSync(agentDir, { recursive: true });
       }

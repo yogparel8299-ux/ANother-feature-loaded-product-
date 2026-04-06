@@ -16,6 +16,7 @@ import type { MCPTool } from './types.js';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import * as os from 'node:os';
+import { getBaseCwd } from './cwd-helper.js';
 
 // Storage paths
 const STORAGE_DIR = '.claude-flow';
@@ -52,7 +53,7 @@ interface PerfStore {
 }
 
 function getPerfDir(): string {
-  return join(process.cwd(), STORAGE_DIR, PERF_DIR);
+  return join(getBaseCwd(), STORAGE_DIR, PERF_DIR);
 }
 
 function getPerfPath(): string {

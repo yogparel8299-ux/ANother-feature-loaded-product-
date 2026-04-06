@@ -12,6 +12,7 @@
 import type { MCPTool } from './types.js';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { getBaseCwd } from './cwd-helper.js';
 
 // Storage paths
 const STORAGE_DIR = '.claude-flow';
@@ -77,7 +78,7 @@ interface CoordinationStore {
 }
 
 function getCoordDir(): string {
-  return join(process.cwd(), STORAGE_DIR, COORD_DIR);
+  return join(getBaseCwd(), STORAGE_DIR, COORD_DIR);
 }
 
 function getCoordPath(): string {
